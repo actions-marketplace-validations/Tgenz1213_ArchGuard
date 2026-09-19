@@ -1,0 +1,186 @@
+package index
+
+import "testing"
+
+func adrWithScope(title string, scope ...string) *ADR {
+	return &ADR{Title: title, Scope: ScopePatterns(scope)}
+}
+
+func TestFilterByScope(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: adrWithScope("no scope"), Score: 0.5},
+		{ADR: adrWithScope("matching scope", "**/*.go"), Score: 0.4},
+		{ADR: adrWithScope("non-matching scope", "**/*.ts"), Score: 0.9},
+	}
+
+	got := filterByScope(candidates, "service.go")
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 candidates to survive, got %d: %+v", len(got), got)
+	}
+	for _, c := range got {
+		if c.ADR.Title == "non-matching scope" {
+			t.Errorf("candidate with non-matching scope should have been filtered out, got %+v", c)
+		}
+	}
+}
+
+func TestFilterByScope_EmptyScopeAlwaysMatches(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: adrWithScope("global ADR"), Score: 0.1},
+	}
+
+	got := filterByScope(candidates, "anything/at/all.rb")
+
+	if len(got) != 1 {
+		t.Fatalf("expected the scopeless ADR to survive for any file, got %d results", len(got))
+	}
+}
+
+func TestRankAndLimit_SortsDescendingAndCuts(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: adrWithScope("low"), Score: 0.2},
+		{ADR: adrWithScope("high"), Score: 0.9},
+		{ADR: adrWithScope("mid"), Score: 0.5},
+	}
+
+	got := rankAndLimit(candidates, 2)
+
+	if len(got) != 2 {
+		t.Fatalf("expected topK=2 results, got %d", len(got))
+	}
+	if got[0].ADR.Title != "high" || got[1].ADR.Title != "mid" {
+		t.Errorf("expected [high, mid] in descending-score order, got [%s, %s]", got[0].ADR.Title, got[1].ADR.Title)
+	}
+}
+
+func TestRankAndLimit_FewerThanTopKReturnsAll(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: adrWithScope("only"), Score: 0.5},
+	}
+
+	got := rankAndLimit(candidates, 5)
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result when candidates < topK, got %d", len(got))
+	}
+}
+
+func TestFilterByThreshold(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: adrWithScope("above"), Score: 0.8},
+		{ADR: adrWithScope("at threshold"), Score: 0.5},
+		{ADR: adrWithScope("below"), Score: 0.2},
+	}
+
+	got := filterByThreshold(candidates, 0.5)
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 candidates at or above threshold, got %d: %+v", len(got), got)
+	}
+	for _, c := range got {
+		if c.ADR.Title == "below" {
+			t.Errorf("candidate below threshold should have been filtered out, got %+v", c)
+		}
+	}
+}
+
+func TestFilterByThreshold_EmptyInput(t *testing.T) {
+	got := filterByThreshold(nil, 0.5)
+	if len(got) != 0 {
+		t.Fatalf("expected no results from empty input, got %d", len(got))
+	}
+}
+
+func TestFilterBelowThreshold_IsFilterByThresholdsComplement(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: adrWithScope("above"), Score: 0.8},
+		{ADR: adrWithScope("at threshold"), Score: 0.5},
+		{ADR: adrWithScope("below"), Score: 0.2},
+	}
+
+	got := filterBelowThreshold(candidates, 0.5)
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 candidate below threshold, got %d: %+v", len(got), got)
+	}
+	if got[0].ADR.Title != "below" {
+		t.Errorf("expected only the below-threshold candidate to survive, got %+v", got[0])
+	}
+}
+
+func TestFilterBelowThreshold_EmptyInput(t *testing.T) {
+	got := filterBelowThreshold(nil, 0.5)
+	if len(got) != 0 {
+		t.Fatalf("expected no results from empty input, got %d", len(got))
+	}
+}
+
+func TestEffectiveThreshold_OverridePresent(t *testing.T) {
+	adr := &ADR{Title: "override", SimilarityThreshold: float64Ptr(0.3)}
+	if got := EffectiveThreshold(adr, 0.75); got != 0.3 {
+		t.Errorf("expected override 0.3, got %v", got)
+	}
+}
+
+func TestEffectiveThreshold_FallsBackToGlobal(t *testing.T) {
+	adr := &ADR{Title: "no override"}
+	if got := EffectiveThreshold(adr, 0.75); got != 0.75 {
+		t.Errorf("expected global fallback 0.75, got %v", got)
+	}
+}
+
+func TestFilterByThreshold_PerADROverrideAppliesInsteadOfGlobal(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: &ADR{Title: "strict override excluded", SimilarityThreshold: float64Ptr(0.9)}, Score: 0.8},
+		{ADR: &ADR{Title: "lenient override included", SimilarityThreshold: float64Ptr(0.5)}, Score: 0.6},
+		{ADR: adrWithScope("no override uses global"), Score: 0.6},
+	}
+
+	got := filterByThreshold(candidates, 0.75)
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 candidate to survive (only the lenient override), got %d: %+v", len(got), got)
+	}
+	if got[0].ADR.Title != "lenient override included" {
+		t.Errorf("expected the per-ADR override to be used instead of the global threshold, got %q", got[0].ADR.Title)
+	}
+}
+
+func TestTruncatedByTopK_ReturnsNilWhenWithinLimit(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: &ADR{Title: "a"}, Score: 0.9},
+		{ADR: &ADR{Title: "b"}, Score: 0.8},
+	}
+	result := truncatedByTopK(candidates, 3)
+	if result != nil {
+		t.Fatalf("expected nil when candidates fit within topK, got %+v", result)
+	}
+}
+
+func TestTruncatedByTopK_ReturnsComplementOfRankAndLimit(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: &ADR{Title: "third"}, Score: 0.7},
+		{ADR: &ADR{Title: "first"}, Score: 0.9},
+		{ADR: &ADR{Title: "second"}, Score: 0.8},
+		{ADR: &ADR{Title: "fourth"}, Score: 0.6},
+		{ADR: &ADR{Title: "fifth"}, Score: 0.5},
+	}
+	result := truncatedByTopK(candidates, 3)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 truncated candidates, got %d: %+v", len(result), result)
+	}
+	if result[0].ADR.Title != "fourth" || result[1].ADR.Title != "fifth" {
+		t.Errorf("expected [fourth, fifth] in descending score order, got %+v", result)
+	}
+}
+
+func TestTruncatedByTopK_NegativeTopKTreatedAsZero(t *testing.T) {
+	candidates := []SearchResult{
+		{ADR: &ADR{Title: "only"}, Score: 0.9},
+	}
+	result := truncatedByTopK(candidates, -1)
+	if len(result) != 1 {
+		t.Fatalf("expected topK<0 to behave like topK=0, got %d: %+v", len(result), result)
+	}
+}

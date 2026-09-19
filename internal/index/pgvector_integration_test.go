@@ -117,7 +117,7 @@ func TestPgStore_Integration(t *testing.T) {
 	connStr := setupPgContainer(t, ctx)
 
 	// 2. Initialize PgStore
-	store, err := index.NewPgStore(connStr, "integration_test_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "integration_test_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 
 	// 3. Load Store
@@ -145,26 +145,257 @@ Test Content`
 	// 5. Build Index
 	provider := mockEmbedProvider()
 	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
-	err = store.BuildIndex(ctx, "test-model", 3, provider, localProvider)
+	_, err = store.BuildIndex(ctx, "test-model", 3, provider, localProvider)
 	require.NoError(t, err)
 
 	// Insert into a second project to test isolation
-	storeOther, err := index.NewPgStore(connStr, "other_project", 5, index.HNSWOptions{})
+	storeOther, err := index.NewPgStore(connStr, "other_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
-	err = storeOther.BuildIndex(ctx, "test-model", 3, provider, localProvider)
+	_, err = storeOther.BuildIndex(ctx, "test-model", 3, provider, localProvider)
 	require.NoError(t, err)
 
 	// Same ADR was inserted into two projects; scoping should return only 1.
-	results := store.Search([]float32{0.1, 0.1}, 0.5, 5)
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
 	assert.Len(t, results, 1)
 	if len(results) > 0 {
 		assert.Equal(t, "Integration Test ADR", results[0].ADR.Title)
 		assert.Equal(t, "Accepted", results[0].ADR.Status)
 		assert.Contains(t, results[0].ADR.Content, "Test Content")
 		assert.Equal(t, "0001", results[0].ADR.ID, "ADR ID (derived from the 0001- filename prefix) should round-trip through PgStore")
-		assert.Equal(t, "**/*.go", results[0].ADR.Scope, "ADR scope glob should round-trip through PgStore")
+		assert.Equal(t, index.ScopePatterns{"**/*.go"}, results[0].ADR.Scope, "ADR scope glob should round-trip through PgStore")
 		// Similarity score should be very high
 		assert.Greater(t, results[0].Score, 0.9)
+	}
+}
+
+func TestPgStore_Integration_MultiPatternScopeRoundTrips(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "multi_scope_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	err = store.Load("", "test-model", 2, "")
+	require.NoError(t, err)
+
+	tmpDir, err := os.MkdirTemp("", "archguard_multi_scope")
+	require.NoError(t, err)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Logf("failed to remove temp dir %s: %v", tmpDir, err)
+		}
+	}()
+
+	adrContent := "---\ntitle: \"Multi Scope ADR\"\nstatus: \"Accepted\"\nscope:\n  - \"internal/api/**\"\n  - \"internal/handlers/**\"\n---\nBody."
+	err = os.WriteFile(filepath.Join(tmpDir, "0001-multi-scope.md"), []byte(adrContent), 0644)
+	require.NoError(t, err)
+
+	provider := mockEmbedProvider()
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+	_, err = store.BuildIndex(ctx, "test-model", 3, provider, localProvider)
+	require.NoError(t, err)
+
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 5, "internal/handlers/foo.go")
+	require.Len(t, results, 1)
+	assert.Equal(t, index.ScopePatterns{"internal/api/**", "internal/handlers/**"}, results[0].ADR.Scope)
+
+	noMatch := store.Search([]float32{0.1, 0.1}, 0.5, 5, "internal/other/foo.go")
+	assert.Len(t, noMatch, 0)
+}
+
+func TestPgStore_Integration_SearchRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "rejected_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	err = store.Load("", "test-model", 2, "")
+	require.NoError(t, err)
+
+	tmpDir, err := os.MkdirTemp("", "archguard_rejected")
+	require.NoError(t, err)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Logf("failed to remove temp dir %s: %v", tmpDir, err)
+		}
+	}()
+
+	closeADR := `---
+title: "Close Miss ADR"
+status: "Accepted"
+---
+Close Content`
+	err = os.WriteFile(filepath.Join(tmpDir, "0001-close.md"), []byte(closeADR), 0644)
+	require.NoError(t, err)
+
+	farADR := `---
+title: "Far Miss ADR"
+status: "Accepted"
+---
+Far Content`
+	err = os.WriteFile(filepath.Join(tmpDir, "0002-far.md"), []byte(farADR), 0644)
+	require.NoError(t, err)
+
+	provider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			if strings.Contains(text, "Close Content") {
+				return []float32{1, 1}, nil
+			}
+			return []float32{0, 1}, nil
+		},
+	}
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
+
+	// Query [1,0]: sim(close)=~0.707, sim(far)=0.0. threshold=0.9 rejects both.
+	rejected := store.SearchRejected([]float32{1, 0}, 0.9, 5, "main.go")
+
+	require.Len(t, rejected, 2)
+	assert.Equal(t, "Close Miss ADR", rejected[0].ADR.Title, "closer reject should rank first")
+	assert.Equal(t, "Far Miss ADR", rejected[1].ADR.Title)
+	assert.Greater(t, rejected[0].Score, rejected[1].Score)
+
+	// Search must be the exact complement: nothing at or above 0.9.
+	hits := store.Search([]float32{1, 0}, 0.9, 5, "main.go")
+	assert.Empty(t, hits, "both ADRs should be rejected, not returned by Search")
+}
+
+func TestPgStore_Integration_SearchTruncated(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "truncated_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	err = store.Load("", "test-model", 2, "")
+	require.NoError(t, err)
+
+	tmpDir, err := os.MkdirTemp("", "archguard_truncated")
+	require.NoError(t, err)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Logf("failed to remove temp dir %s: %v", tmpDir, err)
+		}
+	}()
+
+	adrDefs := []struct {
+		filename string
+		title    string
+		content  string
+	}{
+		{"0001-first.md", "First ADR", "First Content"},
+		{"0002-second.md", "Second ADR", "Second Content"},
+		{"0003-third.md", "Third ADR", "Third Content"},
+	}
+	for _, def := range adrDefs {
+		body := fmt.Sprintf("---\ntitle: %q\nstatus: \"Accepted\"\n---\n%s", def.title, def.content)
+		err = os.WriteFile(filepath.Join(tmpDir, def.filename), []byte(body), 0644)
+		require.NoError(t, err)
+	}
+
+	// All three embed identically to [1,0] so every one clears threshold;
+	// topK=2 must leave exactly one truncated.
+	provider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			return []float32{1, 0}, nil
+		},
+	}
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
+
+	hits := store.Search([]float32{1, 0}, 0.5, 2, "main.go")
+	require.Len(t, hits, 2, "topK=2 should cap Search's hits")
+
+	truncated := store.SearchTruncated([]float32{1, 0}, 0.5, 2, "main.go")
+	require.Len(t, truncated, 1, "the third qualifying ADR should be truncated, not dropped silently")
+
+	for _, h := range hits {
+		assert.NotEqual(t, h.ADR.Title, truncated[0].ADR.Title, "an ADR cannot be both a hit and truncated")
+	}
+}
+
+func TestPgStore_Integration_SearchWithDebugInfo(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "debug_info_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	err = store.Load("", "test-model", 2, "")
+	require.NoError(t, err)
+
+	tmpDir, err := os.MkdirTemp("", "archguard_debug_info")
+	require.NoError(t, err)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Logf("failed to remove temp dir %s: %v", tmpDir, err)
+		}
+	}()
+
+	adrDefs := []struct {
+		filename string
+		title    string
+		content  string
+	}{
+		{"0001-first.md", "First ADR", "First Content"},
+		{"0002-second.md", "Second ADR", "Second Content"},
+		{"0003-third.md", "Third ADR", "Third Content"},
+		{"0004-far.md", "Far ADR", "Far Content"},
+	}
+	for _, def := range adrDefs {
+		body := fmt.Sprintf("---\ntitle: %q\nstatus: \"Accepted\"\n---\n%s", def.title, def.content)
+		err = os.WriteFile(filepath.Join(tmpDir, def.filename), []byte(body), 0644)
+		require.NoError(t, err)
+	}
+
+	// First/Second/Third embed to [1,0] (clear a 0.5 threshold); Far embeds
+	// to [0,1] (rejected). topK=2 leaves 2 hits, 1 truncated, 1 rejected --
+	// all derived from ONE query via SearchWithDebugInfo.
+	provider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			if strings.Contains(text, "Far Content") {
+				return []float32{0, 1}, nil
+			}
+			return []float32{1, 0}, nil
+		},
+	}
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
+
+	hits, rejected, truncated := store.SearchWithDebugInfo([]float32{1, 0}, 0.5, 2, "main.go")
+
+	require.Len(t, hits, 2, "topK=2 should cap hits")
+	require.Len(t, rejected, 1, "Far ADR should be the sole rejected candidate")
+	require.Len(t, truncated, 1, "the third qualifying ADR should be truncated")
+	assert.Equal(t, "Far ADR", rejected[0].ADR.Title)
+
+	seen := map[string]int{}
+	for _, group := range [][]index.SearchResult{hits, rejected, truncated} {
+		for _, r := range group {
+			seen[r.ADR.Title]++
+		}
+	}
+	for title, count := range seen {
+		assert.Equal(t, 1, count, "ADR %q should appear in exactly one of hits/rejected/truncated", title)
 	}
 }
 
@@ -177,7 +408,7 @@ func TestPgStore_Integration_ReindexDisabled(t *testing.T) {
 	connStr := setupPgContainer(t, ctx)
 
 	disabled := false
-	store, err := index.NewPgStore(connStr, "reindex_disabled_project", 5, index.HNSWOptions{Enabled: &disabled})
+	store, err := index.NewPgStore(connStr, "reindex_disabled_project", 5, index.HNSWOptions{Enabled: &disabled}, nil)
 	require.NoError(t, err)
 	require.NoError(t, store.Load("", "test-model", 2, ""))
 
@@ -188,7 +419,7 @@ func TestPgStore_Integration_ReindexDisabled(t *testing.T) {
 
 	// 100% churn, well over the default threshold, but Enabled=false.
 	output := captureStdout(t, func() {
-		err = store.BuildIndex(ctx, "test-model", 3, provider, localProvider)
+		_, err = store.BuildIndex(ctx, "test-model", 3, provider, localProvider)
 	})
 	require.NoError(t, err)
 	assert.NotContains(t, output, "Rebuilding HNSW index")
@@ -209,17 +440,18 @@ func TestPgStore_Integration_ReindexThresholdRespected(t *testing.T) {
 	highLocalProvider := index.NewLocalProvider(highTmpDir, []string{"Accepted"})
 
 	highThreshold := 0.5
-	storeHigh, err := index.NewPgStore(connStr, "reindex_threshold_high", 5, index.HNSWOptions{Threshold: &highThreshold})
+	storeHigh, err := index.NewPgStore(connStr, "reindex_threshold_high", 5, index.HNSWOptions{Threshold: &highThreshold}, nil)
 	require.NoError(t, err)
 	require.NoError(t, storeHigh.Load("", "test-model", 2, ""))
 	// Baseline build: 100% churn (first build), ignored -- only sets up the
 	// "existing" state so the next build's churn reflects the real edit below.
-	require.NoError(t, storeHigh.BuildIndex(ctx, "test-model", 3, provider, highLocalProvider))
+	_, err = storeHigh.BuildIndex(ctx, "test-model", 3, provider, highLocalProvider)
+	require.NoError(t, err)
 
 	modifyADRFile(t, highTmpDir, 0) // 1 of 10 changed = 10% churn
 
 	outputHigh := captureStdout(t, func() {
-		err = storeHigh.BuildIndex(ctx, "test-model", 3, provider, highLocalProvider)
+		_, err = storeHigh.BuildIndex(ctx, "test-model", 3, provider, highLocalProvider)
 	})
 	require.NoError(t, err)
 	assert.NotContains(t, outputHigh, "Rebuilding HNSW index", "10% churn should not exceed a 50% threshold")
@@ -230,15 +462,16 @@ func TestPgStore_Integration_ReindexThresholdRespected(t *testing.T) {
 	lowLocalProvider := index.NewLocalProvider(lowTmpDir, []string{"Accepted"})
 
 	lowThreshold := 0.05
-	storeLow, err := index.NewPgStore(connStr, "reindex_threshold_low", 5, index.HNSWOptions{Threshold: &lowThreshold})
+	storeLow, err := index.NewPgStore(connStr, "reindex_threshold_low", 5, index.HNSWOptions{Threshold: &lowThreshold}, nil)
 	require.NoError(t, err)
 	require.NoError(t, storeLow.Load("", "test-model", 2, ""))
-	require.NoError(t, storeLow.BuildIndex(ctx, "test-model", 3, provider, lowLocalProvider))
+	_, err = storeLow.BuildIndex(ctx, "test-model", 3, provider, lowLocalProvider)
+	require.NoError(t, err)
 
 	modifyADRFile(t, lowTmpDir, 0)
 
 	outputLow := captureStdout(t, func() {
-		err = storeLow.BuildIndex(ctx, "test-model", 3, provider, lowLocalProvider)
+		_, err = storeLow.BuildIndex(ctx, "test-model", 3, provider, lowLocalProvider)
 	})
 	require.NoError(t, err)
 	assert.Contains(t, outputLow, "Rebuilding HNSW index", "10% churn should exceed a 5% threshold")
@@ -259,12 +492,12 @@ func TestPgStore_Integration_ReindexConcurrentlyConfigured(t *testing.T) {
 	writeADRFiles(t, defaultTmpDir, 3)
 	defaultLocalProvider := index.NewLocalProvider(defaultTmpDir, []string{"Accepted"})
 
-	storeDefault, err := index.NewPgStore(connStr, "reindex_concurrently_default", 5, index.HNSWOptions{})
+	storeDefault, err := index.NewPgStore(connStr, "reindex_concurrently_default", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	require.NoError(t, storeDefault.Load("", "test-model", 2, ""))
 
 	outputDefault := captureStdout(t, func() {
-		err = storeDefault.BuildIndex(ctx, "test-model", 3, provider, defaultLocalProvider)
+		_, err = storeDefault.BuildIndex(ctx, "test-model", 3, provider, defaultLocalProvider)
 	})
 	require.NoError(t, err)
 	assert.Contains(t, outputDefault, "Rebuilding HNSW index (concurrently)", "default should use the non-blocking CONCURRENTLY form")
@@ -276,12 +509,12 @@ func TestPgStore_Integration_ReindexConcurrentlyConfigured(t *testing.T) {
 	writeADRFiles(t, blockingTmpDir, 3)
 	blockingLocalProvider := index.NewLocalProvider(blockingTmpDir, []string{"Accepted"})
 
-	storeBlocking, err := index.NewPgStore(connStr, "reindex_concurrently_blocking", 5, index.HNSWOptions{Concurrently: &blocking})
+	storeBlocking, err := index.NewPgStore(connStr, "reindex_concurrently_blocking", 5, index.HNSWOptions{Concurrently: &blocking}, nil)
 	require.NoError(t, err)
 	require.NoError(t, storeBlocking.Load("", "test-model", 2, ""))
 
 	outputBlocking := captureStdout(t, func() {
-		err = storeBlocking.BuildIndex(ctx, "test-model", 3, provider, blockingLocalProvider)
+		_, err = storeBlocking.BuildIndex(ctx, "test-model", 3, provider, blockingLocalProvider)
 	})
 	require.NoError(t, err)
 	assert.Contains(t, outputBlocking, "Rebuilding HNSW index (blocking)", "explicit false should use the blocking REINDEX form")
@@ -311,7 +544,7 @@ func TestPgStore_Integration_IterativeScanDefaultEnabled(t *testing.T) {
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "iterative_scan_default_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "iterative_scan_default_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.Load("", "test-model", 2, ""))
@@ -341,7 +574,7 @@ func TestPgStore_Integration_IterativeScanExplicitlyDisabled(t *testing.T) {
 	connStr := setupPgContainer(t, ctx)
 
 	disabled := false
-	store, err := index.NewPgStore(connStr, "iterative_scan_disabled_project", 5, index.HNSWOptions{IterativeScan: &disabled})
+	store, err := index.NewPgStore(connStr, "iterative_scan_disabled_project", 5, index.HNSWOptions{IterativeScan: &disabled}, nil)
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.Load("", "test-model", 2, ""))
@@ -359,7 +592,7 @@ func TestPgStore_Integration_SyncsMetadataForUnchangedADR(t *testing.T) {
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "sync_metadata_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "sync_metadata_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.Load("", "test-model", 2, ""))
@@ -371,10 +604,10 @@ func TestPgStore_Integration_SyncsMetadataForUnchangedADR(t *testing.T) {
 	`, "sync_metadata_project", "0007-legacy.md", "Legacy ADR", "Accepted", "\nLegacy Content", pgvector.NewVector([]float32{0.1, 0.1}))
 	require.NoError(t, err)
 
-	preSyncResults := store.Search([]float32{0.1, 0.1}, 0.5, 5)
+	preSyncResults := store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
 	require.Len(t, preSyncResults, 1, "Search must still find a row with NULL adr_id/scope columns, not fail the scan")
 	assert.Equal(t, "", preSyncResults[0].ADR.ID, "NULL adr_id should degrade to empty string via COALESCE, not break the scan")
-	assert.Equal(t, "", preSyncResults[0].ADR.Scope, "NULL scope should degrade to empty string via COALESCE, not break the scan")
+	assert.Equal(t, index.ScopePatterns(nil), preSyncResults[0].ADR.Scope, "NULL scope should degrade to empty string via COALESCE, not break the scan")
 
 	tmpDir := t.TempDir()
 	adrContent := "---\ntitle: \"Legacy ADR\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\nLegacy Content"
@@ -384,16 +617,16 @@ func TestPgStore_Integration_SyncsMetadataForUnchangedADR(t *testing.T) {
 	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
 
 	output := captureStdout(t, func() {
-		err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+		_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
 	})
 	require.NoError(t, err)
 	assert.Contains(t, output, "Generating embeddings for 0 new/modified ADRs", "content/title/status are unchanged, so this must NOT re-embed")
-	assert.Contains(t, output, "Syncing ID/scope metadata for 1 unchanged ADR", "the ID/scope mismatch must still trigger the lightweight sync path")
+	assert.Contains(t, output, "Syncing ID/scope/threshold metadata for 1 unchanged ADR", "the ID/scope mismatch must still trigger the lightweight sync path")
 
-	results := store.Search([]float32{0.1, 0.1}, 0.5, 5)
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
 	require.Len(t, results, 1)
 	assert.Equal(t, "0007", results[0].ADR.ID, "adr_id should be backfilled from NULL by the sync path")
-	assert.Equal(t, "**/*.go", results[0].ADR.Scope, "scope should be backfilled from NULL by the sync path")
+	assert.Equal(t, index.ScopePatterns{"**/*.go"}, results[0].ADR.Scope, "scope should be backfilled from NULL by the sync path")
 }
 
 // TestPgStore_Integration_SyncsMetadataForScopeOnlyEdit covers the other
@@ -406,7 +639,7 @@ func TestPgStore_Integration_SyncsMetadataForScopeOnlyEdit(t *testing.T) {
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "scope_only_edit_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "scope_only_edit_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.Load("", "test-model", 2, ""))
@@ -419,26 +652,334 @@ func TestPgStore_Integration_SyncsMetadataForScopeOnlyEdit(t *testing.T) {
 	provider := mockEmbedProvider()
 	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
 
-	require.NoError(t, store.BuildIndex(ctx, "test-model", 2, provider, localProvider))
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
 
-	results := store.Search([]float32{0.1, 0.1}, 0.5, 5)
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
 	require.Len(t, results, 1)
-	assert.Equal(t, "**/*.go", results[0].ADR.Scope, "initial index should embed the original scope")
+	assert.Equal(t, index.ScopePatterns{"**/*.go"}, results[0].ADR.Scope, "initial index should embed the original scope")
 
 	// Same title/status/body -- only the scope: frontmatter value changes.
 	editedContent := "---\ntitle: \"Scope Edit ADR\"\nstatus: \"Accepted\"\nscope: \"**/*.ts\"\n---\nBody unchanged."
 	require.NoError(t, os.WriteFile(adrPath, []byte(editedContent), 0644))
 
 	output := captureStdout(t, func() {
-		err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+		_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
 	})
 	require.NoError(t, err)
 	assert.Contains(t, output, "Generating embeddings for 0 new/modified ADRs", "content/title/status are unchanged, so this must NOT re-embed")
-	assert.Contains(t, output, "Syncing ID/scope metadata for 1 unchanged ADR", "the scope-only change must route through the sync path")
+	assert.Contains(t, output, "Syncing ID/scope/threshold metadata for 1 unchanged ADR", "the scope-only change must route through the sync path")
 
-	results = store.Search([]float32{0.1, 0.1}, 0.5, 5)
+	results = store.Search([]float32{0.1, 0.1}, 0.5, 5, "app.ts")
 	require.Len(t, results, 1)
-	assert.Equal(t, "**/*.ts", results[0].ADR.Scope, "sync path must pick up the new scope value")
+	assert.Equal(t, index.ScopePatterns{"**/*.ts"}, results[0].ADR.Scope, "sync path must pick up the new scope value")
+}
+
+func TestPgStore_Integration_SimilarityThresholdRoundTrips(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "similarity_threshold_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	overrideContent := "---\ntitle: \"Strict ADR\"\nstatus: \"Accepted\"\nsimilarity_threshold: 0.6\n---\nStrict body"
+	defaultContent := "---\ntitle: \"Default ADR\"\nstatus: \"Accepted\"\n---\nDefault body"
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "0001-strict.md"), []byte(overrideContent), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "0002-default.md"), []byte(defaultContent), 0644))
+
+	provider := mockEmbedProvider()
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
+
+	results := store.Search([]float32{0.1, 0.1}, 0.0, 5, "main.go")
+	require.Len(t, results, 2)
+
+	byTitle := make(map[string]index.SearchResult)
+	for _, r := range results {
+		byTitle[r.ADR.Title] = r
+	}
+	require.NotNil(t, byTitle["Strict ADR"].ADR.SimilarityThreshold, "override should round-trip through PgStore")
+	assert.Equal(t, 0.6, *byTitle["Strict ADR"].ADR.SimilarityThreshold)
+	assert.Nil(t, byTitle["Default ADR"].ADR.SimilarityThreshold, "ADR without an override should round-trip as nil, not zero")
+}
+
+// mirrors TestPgStore_Integration_SyncsMetadataForScopeOnlyEdit's adrsToSync
+// trigger, but for a similarity_threshold-only edit.
+func TestPgStore_Integration_SyncsMetadataForThresholdOnlyEdit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "threshold_only_edit_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	adrPath := filepath.Join(tmpDir, "0010-threshold-edit.md")
+	initialContent := "---\ntitle: \"Threshold Edit ADR\"\nstatus: \"Accepted\"\n---\nBody unchanged."
+	require.NoError(t, os.WriteFile(adrPath, []byte(initialContent), 0644))
+
+	provider := mockEmbedProvider()
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
+
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
+	require.Len(t, results, 1)
+	assert.Nil(t, results[0].ADR.SimilarityThreshold, "initial index should have no override")
+
+	// Same title/status/body -- only the similarity_threshold: frontmatter value changes.
+	editedContent := "---\ntitle: \"Threshold Edit ADR\"\nstatus: \"Accepted\"\nsimilarity_threshold: 0.3\n---\nBody unchanged."
+	require.NoError(t, os.WriteFile(adrPath, []byte(editedContent), 0644))
+
+	output := captureStdout(t, func() {
+		_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	})
+	require.NoError(t, err)
+	assert.Contains(t, output, "Generating embeddings for 0 new/modified ADRs", "content/title/status are unchanged, so this must NOT re-embed")
+	assert.Contains(t, output, "Syncing ID/scope/threshold metadata for 1 unchanged ADR", "the threshold-only change must route through the sync path")
+
+	results = store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
+	require.Len(t, results, 1)
+	require.NotNil(t, results[0].ADR.SimilarityThreshold, "sync path must pick up the new threshold value")
+	assert.Equal(t, 0.3, *results[0].ADR.SimilarityThreshold)
+}
+
+// A single failing embed call must not abort the whole build (#133).
+func TestPgStore_Integration_BuildIndexSkipsFailedADRAndContinuesEmbeddingOthers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "embed_failure_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	writeADRFiles(t, tmpDir, 3)
+	// writeADRFiles names files adr_0.md, adr_1.md, adr_2.md with titles
+	// "ADR 0"/"ADR 1"/"ADR 2" -- make adr_1 the one that fails to embed.
+	provider := &llm.MockProvider{
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			if strings.Contains(text, "Title: ADR 1") {
+				return nil, fmt.Errorf("simulated embedding failure")
+			}
+			return []float32{0.1, 0.1}, nil
+		},
+	}
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+
+	var result index.BuildIndexResult
+	output := captureStdout(t, func() {
+		result, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	})
+	require.NoError(t, err, "a single ADR embed failure must not fail the whole build")
+	assert.Contains(t, output, "Warning: skipping ADR adr_1.md")
+
+	require.Len(t, result.Skipped, 1)
+	assert.Equal(t, "adr_1.md", result.Skipped[0].RelPath)
+	assert.Contains(t, result.Skipped[0].Err.Error(), "simulated embedding failure")
+
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 10, "main.go")
+	gotPaths := make(map[string]bool)
+	for _, r := range results {
+		gotPaths[r.ADR.RelPath] = true
+	}
+	assert.True(t, gotPaths["adr_0.md"], "adr_0.md must still be embedded and searchable")
+	assert.True(t, gotPaths["adr_2.md"], "adr_2.md must still be embedded and searchable")
+	assert.False(t, gotPaths["adr_1.md"], "adr_1.md must not appear -- its embed failed, so it was never inserted")
+}
+
+// A failed re-embed must leave the ADR's already-indexed row as it was --
+// not update it to the new content, and not delete it (#133).
+func TestPgStore_Integration_BuildIndexLeavesExistingRowUntouchedOnReEmbedFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "reembed_failure_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	adrPath := filepath.Join(tmpDir, "0010-reembed.md")
+	originalBody := "Original indexed body."
+	originalContent := "---\ntitle: \"Re-embed ADR\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\n" + originalBody
+	require.NoError(t, os.WriteFile(adrPath, []byte(originalContent), 0644))
+
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+
+	_, err = store.BuildIndex(ctx, "test-model", 2, mockEmbedProvider(), localProvider)
+	require.NoError(t, err, "the first build must succeed and persist the row")
+
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
+	require.Len(t, results, 1)
+	require.Contains(t, results[0].ADR.Content, originalBody)
+
+	newBody := "Rewritten body that cannot be embedded."
+	editedContent := "---\ntitle: \"Re-embed ADR\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\n" + newBody
+	require.NoError(t, os.WriteFile(adrPath, []byte(editedContent), 0644))
+
+	failingProvider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			return nil, fmt.Errorf("simulated re-embed failure")
+		},
+	}
+
+	var result index.BuildIndexResult
+	output := captureStdout(t, func() {
+		result, err = store.BuildIndex(ctx, "test-model", 2, failingProvider, localProvider)
+	})
+	// This ADR is the whole corpus, so the all-embeds-failed guard fires --
+	// the point is that it fires WITHOUT having touched the existing row.
+	require.Error(t, err, "every ADR failing to embed must surface as a build-wide error")
+	assert.Contains(t, err.Error(), "index not updated")
+	assert.Contains(t, output, "Warning: skipping ADR 0010-reembed.md")
+	require.Len(t, result.Skipped, 1, "the guard must still report what it skipped")
+	assert.Equal(t, "0010-reembed.md", result.Skipped[0].RelPath)
+	assert.Contains(t, result.Skipped[0].Err.Error(), "embed: ")
+
+	var gotContent string
+	var gotEmbedding pgvector.Vector
+	err = store.Pool().QueryRow(ctx,
+		"SELECT content, embedding FROM archguard_adrs WHERE project_name = $1 AND rel_path = $2",
+		"reembed_failure_project", "0010-reembed.md",
+	).Scan(&gotContent, &gotEmbedding)
+	require.NoError(t, err, "the pre-existing row must still be present, not deleted")
+	assert.Contains(t, gotContent, originalBody, "the row must keep its original content")
+	assert.NotContains(t, gotContent, newBody, "the failed re-embed must not have written the new content")
+	assert.Equal(t, []float32{0.1, 0.1}, gotEmbedding.Slice(), "the row must keep its original embedding")
+
+	results = store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
+	require.Len(t, results, 1, "the original row must still be searchable")
+	assert.Contains(t, results[0].ADR.Content, originalBody)
+}
+
+// A failed INSERT (not a failed embed) must be isolated the same way: the
+// embedding call succeeds, but the write is rejected -- exercises the
+// upsertErr branch specifically, distinct from the embedErr branch above.
+func TestPgStore_Integration_BuildIndexSkipsUpsertFailureAndContinues(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "upsert_failure_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	writeADRFiles(t, tmpDir, 3)
+	// The column is vector(2); returning 3 floats for adr_1 makes the
+	// embed call succeed but the INSERT fail on a dimension mismatch.
+	provider := &llm.MockProvider{
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			if strings.Contains(text, "Title: ADR 1") {
+				return []float32{0.1, 0.1, 0.1}, nil
+			}
+			return []float32{0.1, 0.1}, nil
+		},
+	}
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+
+	var result index.BuildIndexResult
+	output := captureStdout(t, func() {
+		result, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	})
+	require.NoError(t, err, "a single ADR upsert failure must not fail the whole build")
+	assert.Contains(t, output, "Warning: skipping ADR adr_1.md")
+
+	require.Len(t, result.Skipped, 1)
+	assert.Equal(t, "adr_1.md", result.Skipped[0].RelPath)
+	assert.Contains(t, result.Skipped[0].Err.Error(), "upsert: ", "the error must be tagged as an upsert failure, not an embed failure")
+
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 10, "main.go")
+	gotPaths := make(map[string]bool)
+	for _, r := range results {
+		gotPaths[r.ADR.RelPath] = true
+	}
+	assert.True(t, gotPaths["adr_0.md"], "adr_0.md must still be embedded and searchable")
+	assert.True(t, gotPaths["adr_2.md"], "adr_2.md must still be embedded and searchable")
+	assert.False(t, gotPaths["adr_1.md"], "adr_1.md must not appear -- its INSERT failed, so no row exists")
+}
+
+// The all-embeds-failed guard measures the RESULTING corpus, not the
+// attempt count: when an already-indexed, unchanged ADR survives via delta
+// reuse, a build where every *newly attempted* ADR fails must still report
+// success (with the failures listed in Skipped), not a build-wide error --
+// the corpus isn't empty, so this isn't the catastrophic case the guard
+// exists to catch.
+func TestPgStore_Integration_BuildIndexSucceedsWhenAllNewADRsFailButUnchangedADRSurvives(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "partial_delta_failure_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	unchangedContent := "---\ntitle: \"Unchanged ADR\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\nUnchanged body."
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "0011-unchanged.md"), []byte(unchangedContent), 0644))
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+
+	_, err = store.BuildIndex(ctx, "test-model", 2, mockEmbedProvider(), localProvider)
+	require.NoError(t, err, "the first build must index the unchanged ADR successfully")
+
+	// Add two new ADRs whose content always fails to embed; the unchanged
+	// ADR's file is untouched, so it's delta-preserved, not re-attempted.
+	failingContentA := "---\ntitle: \"New Failing A\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\nBody A."
+	failingContentB := "---\ntitle: \"New Failing B\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\nBody B."
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "0012-new-failing-a.md"), []byte(failingContentA), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "0013-new-failing-b.md"), []byte(failingContentB), 0644))
+
+	failingProvider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			return nil, fmt.Errorf("simulated embedding failure")
+		},
+	}
+
+	var result index.BuildIndexResult
+	output := captureStdout(t, func() {
+		result, err = store.BuildIndex(ctx, "test-model", 2, failingProvider, localProvider)
+	})
+	require.NoError(t, err, "the unchanged ADR keeps the corpus non-empty, so this must not be treated as build-wide failure")
+	assert.Contains(t, output, "Generating embeddings for 2 new/modified ADRs", "the unchanged ADR must not be re-attempted")
+	require.Len(t, result.Skipped, 2)
+
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 10, "main.go")
+	require.Len(t, results, 1, "only the unchanged ADR should remain indexed")
+	assert.Equal(t, "0011-unchanged.md", results[0].ADR.RelPath)
 }
 
 // TestPgStore_Integration_BuildIndexMigratesLegacyTableWithoutLoad reproduces
@@ -453,7 +994,7 @@ func TestPgStore_Integration_BuildIndexMigratesLegacyTableWithoutLoad(t *testing
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "legacy_no_load_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "legacy_no_load_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -487,13 +1028,13 @@ func TestPgStore_Integration_BuildIndexMigratesLegacyTableWithoutLoad(t *testing
 
 	// Deliberately skip store.Load() -- this is what broke before BuildIndex
 	// started ensuring its own schema (cli.runIndex never calls Load).
-	err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
 	require.NoError(t, err, "BuildIndex must create/alter its own schema when Load was never called")
 
-	results := store.Search([]float32{0.1, 0.1}, 0.5, 5)
+	results := store.Search([]float32{0.1, 0.1}, 0.5, 5, "main.go")
 	require.Len(t, results, 1)
 	assert.Equal(t, "0009", results[0].ADR.ID)
-	assert.Equal(t, "**/*.go", results[0].ADR.Scope)
+	assert.Equal(t, index.ScopePatterns{"**/*.go"}, results[0].ADR.Scope)
 }
 
 func TestPgStore_Integration_BuildIndexReturnsErrorOnScanFailure(t *testing.T) {
@@ -504,7 +1045,7 @@ func TestPgStore_Integration_BuildIndexReturnsErrorOnScanFailure(t *testing.T) {
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "scan_failure_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "scan_failure_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.Load("", "test-model", 2, ""))
@@ -529,7 +1070,7 @@ func TestPgStore_Integration_BuildIndexReturnsErrorOnScanFailure(t *testing.T) {
 	provider := mockEmbedProvider()
 	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
 
-	err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
 	require.Error(t, err, "a Scan failure on one row must fail BuildIndex, not be silently dropped")
 	assert.Contains(t, err.Error(), "failed to scan existing ADR row")
 }
@@ -565,7 +1106,7 @@ func (f *fakeContentProvider) GetDiff(path string) (string, error) {
 func buildTwoADREngineFixture(t *testing.T, ctx context.Context, connStr, projectName, fileContent string) (*analysis.Engine, *index.PgStore) {
 	t.Helper()
 
-	store, err := index.NewPgStore(connStr, projectName, 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, projectName, 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	require.NoError(t, store.Load("", "test-model", 2, ""))
 
@@ -586,7 +1127,8 @@ func buildTwoADREngineFixture(t *testing.T, ctx context.Context, connStr, projec
 	}
 
 	adrProvider := index.NewLocalProvider(adrDir, []string{"Accepted"})
-	require.NoError(t, store.BuildIndex(ctx, "test-model", 2, llmProvider, adrProvider))
+	_, err = store.BuildIndex(ctx, "test-model", 2, llmProvider, adrProvider)
+	require.NoError(t, err)
 
 	content := &fakeContentProvider{files: map[string]string{"service.go": fileContent}}
 	cfg := &config.Config{
@@ -639,7 +1181,7 @@ func TestPgStore_Integration_EngineBaselineSuppressesOnlyNamedADR(t *testing.T) 
 	defer store.Close()
 
 	b := baseline.New()
-	b.Add("0001", "service.go", "")
+	b.Add(baseline.Entry{ADRID: "0001", File: "service.go"})
 	engine.Baseline = b
 
 	err := engine.Run(ctx)
@@ -647,4 +1189,132 @@ func TestPgStore_Integration_EngineBaselineSuppressesOnlyNamedADR(t *testing.T) 
 	var driftErr *analysis.DriftDetectedError
 	require.ErrorAs(t, err, &driftErr)
 	assert.Equal(t, 1, driftErr.Count, "ADR A (0001) should be baselined while ADR B (0002) still surfaces as a new violation")
+}
+
+// mirrors search_test.go's LocalStore regression test for #134 against a
+// real PgStore -- see that test for the scope-before-topK rationale.
+func TestPgStore_Integration_SearchScopeMatchingADRSurvivesDespiteLowerSimilarity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "scope_before_topk_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	adrs := map[string]string{
+		"0001-distractor-a.md": "---\ntitle: \"Distractor A\"\nstatus: \"Accepted\"\nscope: \"**/*.ts\"\n---\nDistractor A body",
+		"0002-distractor-b.md": "---\ntitle: \"Distractor B\"\nstatus: \"Accepted\"\nscope: \"**/*.ts\"\n---\nDistractor B body",
+		"0003-distractor-c.md": "---\ntitle: \"Distractor C\"\nstatus: \"Accepted\"\nscope: \"**/*.ts\"\n---\nDistractor C body",
+		"0004-scope-match.md":  "---\ntitle: \"Scope Match\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\nScope Match body",
+	}
+	for name, content := range adrs {
+		require.NoError(t, os.WriteFile(filepath.Join(tmpDir, name), []byte(content), 0644))
+	}
+
+	// "Scope Match" embeds a less-aligned vector (~0.707 similarity) than
+	// the distractors (1.0), but it's the only one scoped to "service.go".
+	provider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			if strings.Contains(text, "Scope Match") {
+				return []float32{1, 1}, nil
+			}
+			return []float32{1, 0}, nil
+		},
+	}
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
+
+	results := store.Search([]float32{1, 0}, 0.5, 3, "service.go")
+
+	require.Len(t, results, 1, "expected exactly 1 result (the scope-matching ADR): %+v", results)
+	assert.Equal(t, "Scope Match", results[0].ADR.Title)
+}
+
+// mirrors the topK-vs-scope regression above, but for threshold-vs-scope:
+// scope filtering must see every candidate before threshold is applied.
+func TestPgStore_Integration_SearchScopeMatchingADRSurvivesDespiteBelowThresholdSimilarity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	store, err := index.NewPgStore(connStr, "threshold_after_scope_project", 5, index.HNSWOptions{}, nil)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	adrs := map[string]string{
+		"0001-distractor-a.md": "---\ntitle: \"Distractor A\"\nstatus: \"Accepted\"\nscope: \"**/*.ts\"\n---\nDistractor A body",
+		"0002-distractor-b.md": "---\ntitle: \"Distractor B\"\nstatus: \"Accepted\"\nscope: \"**/*.ts\"\n---\nDistractor B body",
+		"0003-distractor-c.md": "---\ntitle: \"Distractor C\"\nstatus: \"Accepted\"\nscope: \"**/*.ts\"\n---\nDistractor C body",
+		"0004-scope-match.md":  "---\ntitle: \"Scope Match\"\nstatus: \"Accepted\"\nscope: \"**/*.go\"\n---\nScope Match body",
+	}
+	for name, content := range adrs {
+		require.NoError(t, os.WriteFile(filepath.Join(tmpDir, name), []byte(content), 0644))
+	}
+
+	// "Scope Match" is orthogonal to the query (0.0 similarity, below the 0.5
+	// threshold), but it's the only ADR scoped to "service.go" -- a SQL-level threshold predicate would've dropped it before scope filtering ever ran.
+	provider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			if strings.Contains(text, "Scope Match") {
+				return []float32{0, 1}, nil
+			}
+			return []float32{1, 0}, nil
+		},
+	}
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+	_, err = store.BuildIndex(ctx, "test-model", 2, provider, localProvider)
+	require.NoError(t, err)
+
+	results := store.Search([]float32{1, 0}, 0.5, 3, "service.go")
+
+	require.Len(t, results, 0, "expected 0 results: Scope Match is a candidate (fetched, scope-matched) but still below threshold, got %+v", results)
+
+	distractorResults := store.Search([]float32{1, 0}, 0.5, 3, "app.ts")
+	require.Len(t, distractorResults, 3, "expected the 3 distractors (scoped to **/*.ts, similarity 1.0) for a matching file, got %+v", distractorResults)
+}
+
+func TestSearchQuery_HasNoDistanceThresholdPredicate(t *testing.T) {
+	if strings.Contains(index.SearchQuery, "<= $") {
+		t.Fatalf("SearchQuery still has a SQL-level distance-threshold predicate; scope/threshold filtering must happen in Go, not SQL -- query:\n%s", index.SearchQuery)
+	}
+}
+
+func TestPgStore_Integration_ExplicitWriterReceivesProgressNotStdout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	connStr := setupPgContainer(t, ctx)
+
+	var buf bytes.Buffer
+	store, err := index.NewPgStore(connStr, "explicit_writer_project", 5, index.HNSWOptions{}, &buf)
+	require.NoError(t, err)
+	require.NoError(t, store.Load("", "test-model", 2, ""))
+
+	tmpDir := t.TempDir()
+	writeADRFiles(t, tmpDir, 1)
+	localProvider := index.NewLocalProvider(tmpDir, []string{"Accepted"})
+
+	stdoutDuring := captureStdout(t, func() {
+		_, err = store.BuildIndex(ctx, "test-model", 2, mockEmbedProvider(), localProvider)
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, buf.String(), "Found 1 valid ADRs", "progress text should land on the explicit writer")
+	assert.NotContains(t, stdoutDuring, "Found 1 valid ADRs", "progress text must not also leak to the real stdout")
 }

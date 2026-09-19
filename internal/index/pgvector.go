@@ -3,8 +3,11 @@ package index
 import (
 	"context"
 	"fmt"
+	"io"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,6 +37,7 @@ type PgStore struct {
 	projectName      string
 	concurrency      int
 	hnsw             HNSWOptions
+	writer           io.Writer
 }
 
 // IterativeScanSupportedVersion reports whether version is >= 0.8.0, which
@@ -66,7 +70,8 @@ const PgvectorVersionQuery = "SELECT extversion FROM pg_extension WHERE extname 
 
 // NewPgStore initializes a new PgStore connected to the given database URL.
 // hnsw controls automatic HNSW index maintenance and iterative-scan behavior.
-func NewPgStore(connStr string, projectName string, concurrency int, hnsw HNSWOptions) (*PgStore, error) {
+// A nil w defaults to os.Stdout, resolved dynamically at each write.
+func NewPgStore(connStr string, projectName string, concurrency int, hnsw HNSWOptions, w io.Writer) (*PgStore, error) {
 	ctx := context.Background()
 
 	// Ensure the vector extension exists BEFORE setting up the pool
@@ -90,12 +95,12 @@ func NewPgStore(connStr string, projectName string, concurrency int, hnsw HNSWOp
 	switch {
 	case versionErr != nil:
 		if iterativeScanWanted {
-			fmt.Printf("Warning: failed to check pgvector version for hnsw.iterative_scan support (%v); leaving it disabled for all connections from this store.\n", versionErr)
+			diagPrintf(w, "Warning: failed to check pgvector version for hnsw.iterative_scan support (%v); leaving it disabled for all connections from this store.\n", versionErr)
 		}
 	case iterativeScanWanted && IterativeScanSupportedVersion(pgvectorVersion):
 		applyIterativeScan = true
 	case iterativeScanWanted:
-		fmt.Printf("Warning: pgvector %s does not support hnsw.iterative_scan (requires 0.8.0+); project-filtered search recall may be degraded at scale. See docs/arch/0005-hnsw-iterative-scan-for-project-filtered-search.md.\n", pgvectorVersion)
+		diagPrintf(w, "Warning: pgvector %s does not support hnsw.iterative_scan (requires 0.8.0+); project-filtered search recall may be degraded at scale. See docs/arch/0005-hnsw-iterative-scan-for-project-filtered-search.md.\n", pgvectorVersion)
 	}
 
 	config, err := pgxpool.ParseConfig(connStr)
@@ -109,7 +114,7 @@ func NewPgStore(connStr string, projectName string, concurrency int, hnsw HNSWOp
 		}
 		if applyIterativeScan {
 			if _, err := conn.Exec(ctx, "SET hnsw.iterative_scan = 'relaxed_order'"); err != nil {
-				fmt.Printf("Warning: failed to enable hnsw.iterative_scan on a new connection (%v); this connection will use standard (non-iterative) HNSW search instead.\n", err)
+				diagPrintf(w, "Warning: failed to enable hnsw.iterative_scan on a new connection (%v); this connection will use standard (non-iterative) HNSW search instead.\n", err)
 			}
 		}
 		return nil
@@ -126,6 +131,7 @@ func NewPgStore(connStr string, projectName string, concurrency int, hnsw HNSWOp
 		projectName:      projectName,
 		concurrency:      concurrency,
 		hnsw:             hnsw,
+		writer:           w,
 	}, nil
 }
 
@@ -202,7 +208,7 @@ func (s *PgStore) ensureSchema(ctx context.Context, dim int) error {
 
 	rows, err := s.pool.Query(ctx, `
 		SELECT column_name FROM information_schema.columns
-		WHERE table_name = 'archguard_adrs' AND table_schema = current_schema() AND column_name IN ('adr_id', 'scope')
+		WHERE table_name = 'archguard_adrs' AND table_schema = current_schema() AND column_name IN ('adr_id', 'scope', 'similarity_threshold')
 	`)
 	if err != nil {
 		return err
@@ -228,6 +234,9 @@ func (s *PgStore) ensureSchema(ctx context.Context, dim int) error {
 	if !present["scope"] {
 		alters = append(alters, "ADD COLUMN IF NOT EXISTS scope TEXT")
 	}
+	if !present["similarity_threshold"] {
+		alters = append(alters, "ADD COLUMN IF NOT EXISTS similarity_threshold DOUBLE PRECISION")
+	}
 	if len(alters) > 0 {
 		_, err := s.pool.Exec(ctx, "ALTER TABLE archguard_adrs "+strings.Join(alters, ", "))
 		return err
@@ -245,40 +254,51 @@ func (s *PgStore) Save(path string) error {
 	return nil
 }
 
+// thresholdsEqual reports whether two possibly-nil threshold overrides are
+// the same, so BuildIndex's sync-detection can compare them like any other field.
+func thresholdsEqual(a, b *float64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 // BuildIndex parses the ADRs, generates embeddings, and inserts them into the database.
-func (s *PgStore) BuildIndex(ctx context.Context, modelName string, dim int, provider llm.Provider, adrProvider Provider) error {
+func (s *PgStore) BuildIndex(ctx context.Context, modelName string, dim int, provider llm.Provider, adrProvider Provider) (BuildIndexResult, error) {
 	if err := s.ensureSchema(ctx, dim); err != nil {
-		return fmt.Errorf("failed to ensure schema: %w", err)
+		return BuildIndexResult{}, fmt.Errorf("failed to ensure schema: %w", err)
 	}
 
-	validADRs, err := adrProvider.GetADRs(ctx)
+	validADRs, stats, err := adrProvider.GetADRs(ctx)
 	if err != nil {
-		return err
+		return BuildIndexResult{}, err
 	}
 
 	// Fetch existing ADRs from database for this project
-	rows, err := s.pool.Query(ctx, "SELECT rel_path, title, status, content, COALESCE(adr_id, ''), COALESCE(scope, '') FROM archguard_adrs WHERE project_name = $1", s.projectName)
+	rows, err := s.pool.Query(ctx, "SELECT rel_path, title, status, content, COALESCE(adr_id, ''), COALESCE(scope, ''), similarity_threshold FROM archguard_adrs WHERE project_name = $1", s.projectName)
 	if err != nil {
-		return fmt.Errorf("failed to query existing ADRs: %w", err)
+		return BuildIndexResult{}, fmt.Errorf("failed to query existing ADRs: %w", err)
 	}
 	defer rows.Close()
 
 	existingMap := make(map[string]ADR)
 	for rows.Next() {
 		var relPath, title, status, content, adrID, scope string
-		if err := rows.Scan(&relPath, &title, &status, &content, &adrID, &scope); err != nil {
-			return fmt.Errorf("failed to scan existing ADR row: %w", err)
+		var similarityThreshold *float64
+		if err := rows.Scan(&relPath, &title, &status, &content, &adrID, &scope, &similarityThreshold); err != nil {
+			return BuildIndexResult{}, fmt.Errorf("failed to scan existing ADR row: %w", err)
 		}
 		existingMap[relPath] = ADR{
-			ID:      adrID,
-			Title:   title,
-			Status:  status,
-			Content: content,
-			Scope:   scope,
+			ID:                  adrID,
+			Title:               title,
+			Status:              status,
+			Content:             content,
+			Scope:               ParseScopePatterns(scope),
+			SimilarityThreshold: similarityThreshold,
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed to read existing ADRs: %w", err)
+		return BuildIndexResult{}, fmt.Errorf("failed to read existing ADRs: %w", err)
 	}
 
 	var adrsToEmbed []int
@@ -288,12 +308,15 @@ func (s *PgStore) BuildIndex(ctx context.Context, modelName string, dim int, pro
 		switch {
 		case !ok || existing.Content != valid.Content || existing.Title != valid.Title || existing.Status != valid.Status:
 			adrsToEmbed = append(adrsToEmbed, i)
-		case existing.ID != valid.ID || existing.Scope != valid.Scope:
+		case existing.ID != valid.ID || !slices.Equal(existing.Scope, valid.Scope) || !thresholdsEqual(existing.SimilarityThreshold, valid.SimilarityThreshold):
 			adrsToSync = append(adrsToSync, i)
 		}
 	}
 
-	fmt.Printf("Found %d valid ADRs. Generating embeddings for %d new/modified ADRs...\n", len(validADRs), len(adrsToEmbed))
+	diagPrintf(s.writer, "Found %d valid ADRs. Generating embeddings for %d new/modified ADRs...\n", len(validADRs), len(adrsToEmbed))
+
+	result := BuildIndexResult{IndexSummary: summarizeCorpus(validADRs, stats), Attempted: true}
+	failed := make(map[int]bool)
 
 	if len(adrsToEmbed) > 0 {
 		concurrency := s.concurrency
@@ -301,53 +324,78 @@ func (s *PgStore) BuildIndex(ctx context.Context, modelName string, dim int, pro
 			concurrency = 5
 		}
 
-		g, gCtx := errgroup.WithContext(ctx)
+		var mu sync.Mutex
+		g := new(errgroup.Group)
 		g.SetLimit(concurrency)
+
+		markFailed := func(idx int, err error) {
+			mu.Lock()
+			failed[idx] = true
+			result.Skipped = append(result.Skipped, SkippedADR{RelPath: validADRs[idx].RelPath, Err: err})
+			diagPrintf(s.writer, "\nWarning: skipping ADR %s: %v\n", validADRs[idx].RelPath, err)
+			mu.Unlock()
+		}
 
 		for _, idx := range adrsToEmbed {
 			idx := idx
 			g.Go(func() error {
 				textToEmbed := fmt.Sprintf("Title: %s\nStatus: %s\nContent: %s", validADRs[idx].Title, validADRs[idx].Status, validADRs[idx].Content)
-				emb, err := provider.CreateEmbedding(gCtx, textToEmbed, llm.EmbeddingTaskDocument)
-				if err != nil {
-					return fmt.Errorf("failed to embed ADR %s: %w", validADRs[idx].RelPath, err)
+				emb, embErr := provider.CreateEmbedding(ctx, textToEmbed, llm.EmbeddingTaskDocument)
+				if embErr != nil {
+					markFailed(idx, fmt.Errorf("embed: %w", embErr))
+					return nil
 				}
 				validADRs[idx].Embedding = emb
 
 				vec := pgvector.NewVector(emb)
-				_, err = s.pool.Exec(gCtx, `
-					INSERT INTO archguard_adrs (project_name, rel_path, title, status, content, embedding, adr_id, scope)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				_, upsertErr := s.pool.Exec(ctx, `
+					INSERT INTO archguard_adrs (project_name, rel_path, title, status, content, embedding, adr_id, scope, similarity_threshold)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 					ON CONFLICT (project_name, rel_path) DO UPDATE SET
 						title = EXCLUDED.title,
 						status = EXCLUDED.status,
 						content = EXCLUDED.content,
 						embedding = EXCLUDED.embedding,
 						adr_id = EXCLUDED.adr_id,
-						scope = EXCLUDED.scope
-				`, s.projectName, validADRs[idx].RelPath, validADRs[idx].Title, validADRs[idx].Status, validADRs[idx].Content, vec, validADRs[idx].ID, validADRs[idx].Scope)
-				if err != nil {
-					return fmt.Errorf("failed to upsert ADR %s: %w", validADRs[idx].RelPath, err)
+						scope = EXCLUDED.scope,
+						similarity_threshold = EXCLUDED.similarity_threshold
+				`, s.projectName, validADRs[idx].RelPath, validADRs[idx].Title, validADRs[idx].Status, validADRs[idx].Content, vec, validADRs[idx].ID, validADRs[idx].Scope, validADRs[idx].SimilarityThreshold)
+				if upsertErr != nil {
+					markFailed(idx, fmt.Errorf("upsert: %w", upsertErr))
+					return nil
 				}
-				fmt.Printf(".")
+				mu.Lock()
+				diagPrintf(s.writer, ".")
+				mu.Unlock()
 				return nil
 			})
 		}
 
-		if err := g.Wait(); err != nil {
-			return err
-		}
-		fmt.Println()
+		_ = g.Wait()
+		diagPrintln(s.writer)
+	}
+
+	// Valid means successfully indexed, not merely status-accepted.
+	result.Valid = len(validADRs) - len(failed)
+
+	// Checked unconditionally: a ctx canceled before a no-embed run (every
+	// ADR unchanged) must still surface, not fall through as success.
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+
+	if len(validADRs) > 0 && len(failed) == len(validADRs) {
+		return result, fmt.Errorf("all %d ADR(s) failed to embed or persist; index not updated", len(validADRs))
 	}
 
 	if len(adrsToSync) > 0 {
-		fmt.Printf("Syncing ID/scope metadata for %d unchanged ADR(s)...\n", len(adrsToSync))
+		diagPrintf(s.writer, "Syncing ID/scope/threshold metadata for %d unchanged ADR(s)...\n", len(adrsToSync))
 		batch := &pgx.Batch{}
 		for _, idx := range adrsToSync {
 			batch.Queue(`
-				UPDATE archguard_adrs SET adr_id = $1, scope = $2
-				WHERE project_name = $3 AND rel_path = $4
-			`, validADRs[idx].ID, validADRs[idx].Scope, s.projectName, validADRs[idx].RelPath)
+				UPDATE archguard_adrs SET adr_id = $1, scope = $2, similarity_threshold = $3
+				WHERE project_name = $4 AND rel_path = $5
+			`, validADRs[idx].ID, validADRs[idx].Scope, validADRs[idx].SimilarityThreshold, s.projectName, validADRs[idx].RelPath)
 		}
 
 		br := s.pool.SendBatch(ctx, batch)
@@ -355,14 +403,14 @@ func (s *PgStore) BuildIndex(ctx context.Context, modelName string, dim int, pro
 			tag, err := br.Exec()
 			if err != nil {
 				_ = br.Close()
-				return fmt.Errorf("failed to sync metadata for ADR %s: %w", validADRs[idx].RelPath, err)
+				return result, fmt.Errorf("failed to sync metadata for ADR %s: %w", validADRs[idx].RelPath, err)
 			}
 			if tag.RowsAffected() == 0 {
-				fmt.Printf("Warning: sync UPDATE for %s affected 0 rows (row may have been deleted concurrently)\n", validADRs[idx].RelPath)
+				diagPrintf(s.writer, "Warning: sync UPDATE for %s affected 0 rows (row may have been deleted concurrently)\n", validADRs[idx].RelPath)
 			}
 		}
 		if err := br.Close(); err != nil {
-			return fmt.Errorf("failed to close sync batch: %w", err)
+			return result, fmt.Errorf("failed to close sync batch: %w", err)
 		}
 	}
 
@@ -380,18 +428,18 @@ func (s *PgStore) BuildIndex(ctx context.Context, modelName string, dim int, pro
 	}
 
 	if len(toDelete) > 0 {
-		fmt.Printf("Deleting %d removed ADRs from database...\n", len(toDelete))
+		diagPrintf(s.writer, "Deleting %d removed ADRs from database...\n", len(toDelete))
 		for _, relPath := range toDelete {
 			_, err := s.pool.Exec(ctx, "DELETE FROM archguard_adrs WHERE project_name = $1 AND rel_path = $2", s.projectName, relPath)
 			if err != nil {
-				return fmt.Errorf("failed to delete ADR %s: %w", relPath, err)
+				return result, fmt.Errorf("failed to delete ADR %s: %w", relPath, err)
 			}
 		}
 	}
 
 	// Conditional HNSW maintenance routine
 	if s.reindexEnabled() {
-		modifiedCount := len(adrsToEmbed) + len(toDelete)
+		modifiedCount := (len(adrsToEmbed) - len(failed)) + len(toDelete)
 		totalCount := len(validADRs) + len(toDelete)
 		threshold := s.reindexThreshold()
 		if totalCount > 0 && float64(modifiedCount)/float64(totalCount) >= threshold {
@@ -399,56 +447,128 @@ func (s *PgStore) BuildIndex(ctx context.Context, modelName string, dim int, pro
 			if s.reindexConcurrently() {
 				mode = "concurrently"
 			}
-			fmt.Printf("Modifications exceeded %.0f%% threshold. Rebuilding HNSW index (%s)...\n", threshold*100, mode)
+			diagPrintf(s.writer, "Modifications exceeded %.0f%% threshold. Rebuilding HNSW index (%s)...\n", threshold*100, mode)
 			if _, err := s.pool.Exec(ctx, s.reindexStatement()); err != nil {
-				fmt.Printf("Warning: failed to reindex HNSW graph: %v\n", err)
+				diagPrintf(s.writer, "Warning: failed to reindex HNSW graph: %v\n", err)
 			}
 		}
 	}
 
-	return nil
+	return result, nil
 }
 
 // SearchQuery is exported so pgvector_bench_test.go can EXPLAIN this exact
-// query, instead of a copy that could drift.
+// query, instead of a copy that could drift; scope/threshold filtering happens in Go, not SQL.
 const SearchQuery = `
-	SELECT rel_path, title, status, content, COALESCE(adr_id, '') AS adr_id, COALESCE(scope, '') AS scope, (1 - (embedding <=> $1)) as similarity
+	SELECT rel_path, title, status, content, COALESCE(adr_id, '') AS adr_id, COALESCE(scope, '') AS scope, similarity_threshold, (1 - (embedding <=> $1)) as similarity
 	FROM archguard_adrs
-	WHERE project_name = $2 AND embedding <=> $1 <= $3
+	WHERE project_name = $2
 	ORDER BY embedding <=> $1
-	LIMIT $4
+	LIMIT $3
 `
 
-// Search performs a vector similarity search across the Postgres store using cosine distance.
-func (s *PgStore) Search(queryEmbedding []float32, threshold float64, topK int) []SearchResult {
+// MaxSearchCandidates bounds PgStore.Search's and SearchRejected's fetch
+// (nearest rows by distance) so Go-side filtering sees every candidate.
+const MaxSearchCandidates = 1000
+
+// scanSearchResults drains rows into SearchResults, skipping any row that
+// fails to scan (logged, not fatal -- one bad row shouldn't drop the rest).
+func scanSearchResults(rows pgx.Rows, w io.Writer) []SearchResult {
+	var candidates []SearchResult
+	for rows.Next() {
+		var adr ADR
+		var score float64
+		if err := rows.Scan(&adr.RelPath, &adr.Title, &adr.Status, &adr.Content, &adr.ID, &adr.Scope, &adr.SimilarityThreshold, &score); err != nil {
+			diagPrintf(w, "PgStore Row scan failed: %v\n", err)
+			continue
+		}
+		candidates = append(candidates, SearchResult{ADR: &adr, Score: score})
+	}
+	return candidates
+}
+
+// Search returns up to topK ADRs matching filePath's scope and at least
+// threshold similarity -- scope then threshold then topK (see filterByScope, filterByThreshold, rankAndLimit).
+func (s *PgStore) Search(queryEmbedding []float32, threshold float64, topK int, filePath string) []SearchResult {
 	ctx := context.Background()
 	vec := pgvector.NewVector(queryEmbedding)
 
-	// pgvector uses <=> for cosine distance. Similarity is 1 - distance.
-	// So similarity >= threshold means distance <= 1 - threshold.
-	distanceThreshold := 1.0 - threshold
-
-	rows, err := s.pool.Query(ctx, SearchQuery, vec, s.projectName, distanceThreshold, topK)
+	rows, err := s.pool.Query(ctx, SearchQuery, vec, s.projectName, MaxSearchCandidates)
 	if err != nil {
-		fmt.Printf("PgStore Search query failed: %v\n", err)
+		diagPrintf(s.writer, "PgStore Search query failed: %v\n", err)
 		return nil
 	}
 	defer rows.Close()
 
-	var results []SearchResult
-	for rows.Next() {
-		var adr ADR
-		var score float64
-		if err := rows.Scan(&adr.RelPath, &adr.Title, &adr.Status, &adr.Content, &adr.ID, &adr.Scope, &score); err != nil {
-			fmt.Printf("PgStore Row scan failed: %v\n", err)
-			continue
-		}
+	candidates := scanSearchResults(rows, s.writer)
+	candidates = filterByScope(candidates, filePath)
+	candidates = filterByThreshold(candidates, threshold)
+	return rankAndLimit(candidates, topK)
+}
 
-		results = append(results, SearchResult{
-			ADR:   &adr,
-			Score: score,
-		})
+// SearchRejected returns up to topK scope-matched ADRs that scored below
+// threshold, ranked by descending similarity -- for --debug diagnostics only.
+func (s *PgStore) SearchRejected(queryEmbedding []float32, threshold float64, topK int, filePath string) []SearchResult {
+	ctx := context.Background()
+	vec := pgvector.NewVector(queryEmbedding)
+
+	rows, err := s.pool.Query(ctx, SearchQuery, vec, s.projectName, MaxSearchCandidates)
+	if err != nil {
+		diagPrintf(s.writer, "PgStore SearchRejected query failed: %v\n", err)
+		return nil
 	}
+	defer rows.Close()
 
-	return results
+	candidates := scanSearchResults(rows, s.writer)
+	candidates = filterByScope(candidates, filePath)
+	candidates = filterBelowThreshold(candidates, threshold)
+	return rankAndLimit(candidates, topK)
+}
+
+// SearchTruncated returns scope-matched, threshold-passing candidates that
+// were cut purely by the topK limit -- Search's other complement, alongside
+// SearchRejected, for --debug diagnostics only.
+func (s *PgStore) SearchTruncated(queryEmbedding []float32, threshold float64, topK int, filePath string) []SearchResult {
+	ctx := context.Background()
+	vec := pgvector.NewVector(queryEmbedding)
+
+	rows, err := s.pool.Query(ctx, SearchQuery, vec, s.projectName, MaxSearchCandidates)
+	if err != nil {
+		diagPrintf(s.writer, "PgStore SearchTruncated query failed: %v\n", err)
+		return nil
+	}
+	defer rows.Close()
+
+	candidates := scanSearchResults(rows, s.writer)
+	candidates = filterByScope(candidates, filePath)
+	candidates = filterByThreshold(candidates, threshold)
+	return truncatedByTopK(candidates, topK)
+}
+
+// SearchWithDebugInfo derives hits, rejected, and truncated from one query's
+// candidate set, so all three are guaranteed consistent with each other --
+// see the VectorStore interface doc for why that matters for PgStore
+// specifically (independent queries can see different approximate results
+// under hnsw.iterative_scan=relaxed_order).
+func (s *PgStore) SearchWithDebugInfo(queryEmbedding []float32, threshold float64, topK int, filePath string) (hits, rejected, truncated []SearchResult) {
+	ctx := context.Background()
+	vec := pgvector.NewVector(queryEmbedding)
+
+	rows, err := s.pool.Query(ctx, SearchQuery, vec, s.projectName, MaxSearchCandidates)
+	if err != nil {
+		diagPrintf(s.writer, "PgStore SearchWithDebugInfo query failed: %v\n", err)
+		return nil, nil, nil
+	}
+	defer rows.Close()
+
+	candidates := filterByScope(scanSearchResults(rows, s.writer), filePath)
+
+	belowCopy := append([]SearchResult(nil), candidates...)
+	rejected = rankAndLimit(filterBelowThreshold(belowCopy, threshold), topK)
+
+	qualifying := filterByThreshold(append([]SearchResult(nil), candidates...), threshold)
+	hits = rankAndLimit(qualifying, topK)
+	truncated = truncatedByTopK(qualifying, topK)
+
+	return hits, rejected, truncated
 }

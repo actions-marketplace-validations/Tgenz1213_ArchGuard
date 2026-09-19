@@ -1,8 +1,10 @@
 package index
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +13,26 @@ import (
 
 	"github.com/tgenz1213/archguard/internal/llm"
 )
+
+func TestLocalStore_CalculateHash_ChangesWhenIDChanges(t *testing.T) {
+	s := NewLocalStore(1)
+
+	adrsBefore := []ADR{{ID: "0001", RelPath: "0001-foo.md", Content: "Body"}}
+	adrsAfter := []ADR{{ID: "1", RelPath: "0001-foo.md", Content: "Body"}}
+
+	hashBefore, err := s.CalculateHash(adrsBefore, "model")
+	if err != nil {
+		t.Fatalf("CalculateHash failed: %v", err)
+	}
+	hashAfter, err := s.CalculateHash(adrsAfter, "model")
+	if err != nil {
+		t.Fatalf("CalculateHash failed: %v", err)
+	}
+
+	if hashBefore == hashAfter {
+		t.Errorf("expected hash to change when ADR.ID changes with identical RelPath/Content, got same hash %q for both", hashBefore)
+	}
+}
 
 func TestStore_Save_Atomic(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "archguard_index_test")
@@ -90,12 +112,13 @@ func TestStore_Save_RenameFailure_CleansUpTmpFile(t *testing.T) {
 }
 
 type mockADRProvider struct {
-	adrs []ADR
-	err  error
+	adrs  []ADR
+	stats FetchStats
+	err   error
 }
 
-func (m *mockADRProvider) GetADRs(ctx context.Context) ([]ADR, error) {
-	return m.adrs, m.err
+func (m *mockADRProvider) GetADRs(ctx context.Context) ([]ADR, FetchStats, error) {
+	return m.adrs, m.stats, m.err
 }
 
 func TestLocalStore_BuildIndex_GeneratesEmbeddings(t *testing.T) {
@@ -108,7 +131,7 @@ func TestLocalStore_BuildIndex_GeneratesEmbeddings(t *testing.T) {
 	adrProvider := &mockADRProvider{adrs: adrs}
 
 	store := NewLocalStore(2)
-	if err := store.BuildIndex(context.Background(), "mock-model", 4, provider, adrProvider); err != nil {
+	if _, err := store.BuildIndex(context.Background(), "mock-model", 4, provider, adrProvider); err != nil {
 		t.Fatalf("BuildIndex failed: %v", err)
 	}
 
@@ -139,7 +162,7 @@ func TestLocalStore_BuildIndex_UsesDocumentTaskType(t *testing.T) {
 	adrProvider := &mockADRProvider{adrs: adrs}
 
 	store := NewLocalStore(2)
-	if err := store.BuildIndex(context.Background(), "mock-model", 4, provider, adrProvider); err != nil {
+	if _, err := store.BuildIndex(context.Background(), "mock-model", 4, provider, adrProvider); err != nil {
 		t.Fatalf("BuildIndex failed: %v", err)
 	}
 
@@ -148,10 +171,11 @@ func TestLocalStore_BuildIndex_UsesDocumentTaskType(t *testing.T) {
 	}
 }
 
-func TestLocalStore_BuildIndex_ReturnsErrorOnEmbedFailure(t *testing.T) {
+func TestLocalStore_BuildIndex_SkipsFailedADRAndContinuesEmbeddingOthers(t *testing.T) {
 	adrs := []ADR{
 		{RelPath: "0001-a.md", Title: "A", Status: "Accepted", Content: "content a"},
 		{RelPath: "0002-fails.md", Title: "B", Status: "Accepted", Content: "content b"},
+		{RelPath: "0003-c.md", Title: "C", Status: "Accepted", Content: "content c"},
 	}
 	provider := &llm.MockProvider{
 		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
@@ -164,11 +188,158 @@ func TestLocalStore_BuildIndex_ReturnsErrorOnEmbedFailure(t *testing.T) {
 	adrProvider := &mockADRProvider{adrs: adrs}
 
 	store := NewLocalStore(2)
-	err := store.BuildIndex(context.Background(), "mock-model", 2, provider, adrProvider)
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	result, err := store.BuildIndex(context.Background(), "mock-model", 2, provider, adrProvider)
+	if err != nil {
+		t.Fatalf("BuildIndex must not return an error for a single ADR embed failure, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "0002-fails.md") {
-		t.Errorf("expected error to reference failing ADR path, got: %v", err)
+
+	if len(result.Skipped) != 1 {
+		t.Fatalf("expected 1 skipped ADR, got %d: %+v", len(result.Skipped), result.Skipped)
+	}
+	if result.Skipped[0].RelPath != "0002-fails.md" {
+		t.Errorf("expected skipped ADR to be 0002-fails.md, got %s", result.Skipped[0].RelPath)
+	}
+	if !strings.Contains(result.Skipped[0].Err.Error(), "simulated embedding failure") {
+		t.Errorf("expected skipped ADR error to reference the underlying failure, got: %v", result.Skipped[0].Err)
+	}
+	if result.Valid != 2 {
+		t.Errorf("expected Valid to count only successfully-indexed ADRs (2), got %d", result.Valid)
+	}
+
+	if len(store.ADRs) != 2 {
+		t.Fatalf("expected 2 ADRs to remain in the corpus (the failed one excluded), got %d", len(store.ADRs))
+	}
+	for _, adr := range store.ADRs {
+		if adr.RelPath == "0002-fails.md" {
+			t.Errorf("failed ADR 0002-fails.md must be excluded from the corpus, but it is present")
+		}
+		if len(adr.Embedding) == 0 {
+			t.Errorf("ADR %s: expected a non-empty embedding, got none", adr.RelPath)
+		}
+	}
+}
+
+// Attempted lets a caller tell "fetch never happened" apart from "fetch
+// happened and found nothing," which look identical from zero counts alone.
+func TestLocalStore_BuildIndex_AttemptedFalseWhenFetchFails(t *testing.T) {
+	provider := &llm.MockProvider{EmbeddingDim: 2}
+	adrProvider := &mockADRProvider{err: fmt.Errorf("boom")}
+
+	store := NewLocalStore(2)
+	result, err := store.BuildIndex(context.Background(), "mock-model", 2, provider, adrProvider)
+	if err == nil {
+		t.Fatal("expected an error when the ADR provider fails")
+	}
+	if result.Attempted {
+		t.Error("expected Attempted to be false when GetADRs itself failed")
+	}
+}
+
+func TestLocalStore_BuildIndex_AttemptedTrueOnSuccess(t *testing.T) {
+	adrs := []ADR{{RelPath: "0001-a.md", Title: "A", Status: "Accepted", Content: "content a"}}
+	provider := &llm.MockProvider{EmbeddingDim: 2}
+	adrProvider := &mockADRProvider{adrs: adrs}
+
+	store := NewLocalStore(2)
+	result, err := store.BuildIndex(context.Background(), "mock-model", 2, provider, adrProvider)
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if !result.Attempted {
+		t.Error("expected Attempted to be true once GetADRs succeeded")
+	}
+}
+
+// A canceled ctx must surface as a build-wide error even when there was
+// nothing to embed this run (every ADR unchanged) -- the check can't be
+// gated on adrsToEmbed being non-empty (#133 review feedback).
+func TestLocalStore_BuildIndex_DetectsCancelledContextOnNoEmbedRun(t *testing.T) {
+	adrs := []ADR{
+		{RelPath: "0001-a.md", Title: "A", Status: "Accepted", Content: "content a"},
+	}
+	provider := &llm.MockProvider{EmbeddingDim: 2}
+	adrProvider := &mockADRProvider{adrs: adrs}
+
+	store := NewLocalStore(2)
+	if _, err := store.BuildIndex(context.Background(), "mock-model", 2, provider, adrProvider); err != nil {
+		t.Fatalf("initial BuildIndex failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.BuildIndex(ctx, "mock-model", 2, provider, adrProvider)
+	if err == nil {
+		t.Fatal("expected an error from a canceled context on a no-embed run, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected the error to wrap context.Canceled, got: %v", err)
+	}
+}
+
+func TestLocalStore_BuildIndex_PreservesSimilarityThresholdOverride(t *testing.T) {
+	override := 0.6
+	adrs := []ADR{
+		{RelPath: "0001-a.md", Title: "A", Status: "Accepted", Content: "content a", SimilarityThreshold: &override},
+		{RelPath: "0002-b.md", Title: "B", Status: "Accepted", Content: "content b"},
+	}
+	provider := &llm.MockProvider{EmbeddingDim: 4}
+	adrProvider := &mockADRProvider{adrs: adrs}
+
+	store := NewLocalStore(2)
+	if _, err := store.BuildIndex(context.Background(), "mock-model", 4, provider, adrProvider); err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+
+	byPath := make(map[string]ADR)
+	for _, adr := range store.ADRs {
+		byPath[adr.RelPath] = adr
+	}
+	if got := byPath["0001-a.md"].SimilarityThreshold; got == nil || *got != 0.6 {
+		t.Errorf("expected 0001-a.md to keep its similarity_threshold override, got %v", got)
+	}
+	if got := byPath["0002-b.md"].SimilarityThreshold; got != nil {
+		t.Errorf("expected 0002-b.md to have no override, got %v", *got)
+	}
+}
+
+func TestLocalStore_BuildIndex_WritesProgressToConfiguredWriter(t *testing.T) {
+	dir := t.TempDir()
+	writeADRFile(t, dir, "0001-a.md", "---\ntitle: A\nstatus: Accepted\n---\nBody")
+
+	provider := NewLocalProvider(dir, []string{"Accepted"})
+	embedProvider := &llm.MockProvider{
+		EmbeddingDim: 2,
+		EmbedFunc: func(ctx context.Context, text string, task llm.EmbeddingTaskType) ([]float32, error) {
+			return []float32{0.1, 0.2}, nil
+		},
+	}
+
+	var buf bytes.Buffer
+	store := NewLocalStore(1)
+	store.writer = &buf
+
+	_, err := store.BuildIndex(context.Background(), "model", 2, embedProvider, provider)
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "Found 1 valid ADRs") {
+		t.Errorf("expected progress text on the configured writer, got %q", buf.String())
+	}
+}
+
+func TestLocalStore_Load_MissingFileReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	s := NewLocalStore(1)
+	missingPath := filepath.Join(tmpDir, "does-not-exist.json")
+
+	err := s.Load(missingPath, "model", 768, "somehash")
+	if err == nil {
+		t.Fatal("expected Load to return a non-nil error when the index file does not exist, got nil")
+	}
+	if len(s.ADRs) != 0 {
+		t.Fatalf("expected ADRs to remain empty on a missing-file Load, got %d", len(s.ADRs))
 	}
 }

@@ -6,12 +6,15 @@ llm:
   base_url: "http://localhost:11434"
   max_tokens: 8000
   temperature: 0.0
+  # system_prompt: "..." # optional; fully replaces ArchGuard's default judgment
+  #   instructions (literal-contradiction, no-inference rules). When set, it is
+  #   the only source of judgment behavior sent to the LLM.
 
 vector_store:
   provider: "ollama" # Default provider for Embeddings
   model: "nomic-embed-text"
   embedding_dim: 768
-  similarity_threshold: 0.75
+  similarity_threshold: 0.75 # Global default; an ADR's own frontmatter similarity_threshold overrides this per-ADR
   embedding_concurrency: 5
   # Postgres/pgvector-backed store (PgStore) instead of the local JSON index
   # (LocalStore). Uncomment and set connection_string to switch backends; the
@@ -24,6 +27,7 @@ vector_store:
 
 analysis:
   adr_path: "./docs/arch"
+  # adr_id_pattern: '^adr-(\d+)-'  # Optional: overrides default first-hyphen-split ADR ID extraction
   accepted_statuses: ["Accepted", "Active"]
   exclude_patterns:
     - "**/*_test.go"

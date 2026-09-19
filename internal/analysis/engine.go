@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -36,14 +38,44 @@ type Engine struct {
 	// UpdateBaseline, when true, bypasses Baseline and collects a fresh
 	// snapshot into CollectedBaseline instead.
 	UpdateBaseline bool
+	// BaselineReason, when non-empty, is recorded as the Reason on every
+	// entry collected this run, overriding any reason carried forward from
+	// a matching (ADR ID, file) entry in the previous Baseline.
+	BaselineReason string
 	// CollectedBaseline is populated by Run when UpdateBaseline is true; cli.go saves it.
 	CollectedBaseline *baseline.Baseline
-	// SkippedFiles is populated by Run when UpdateBaseline is true: the count
-	// of files skipped due to per-file errors (fetchContext/CreateEmbedding failures).
+	// SkippedFiles is populated by Run in every mode: the count of files
+	// skipped due to per-file errors (fetchContext/CreateEmbedding failures).
 	SkippedFiles int
-	// SkippedADRChecks is populated by Run when UpdateBaseline is true: the
-	// count of per-ADR checks skipped due to llm.AnalyzeDrift failures.
+	// SkippedADRChecks is populated by Run in every mode: the count of
+	// per-ADR checks skipped due to llm.AnalyzeDrift failures.
 	SkippedADRChecks int
+	// JSONOutput, when true, routes Info/Log and per-file progress text to
+	// Writer (cli.go points it at stderr) instead of stdout, and populates
+	// CollectedViolations so the caller can emit a JSON report on stdout.
+	JSONOutput bool
+	// Writer receives human-readable Info/Log/progress output. Defaults to
+	// os.Stdout when nil.
+	Writer io.Writer
+	// CollectedViolations is populated by Run when JSONOutput is true: the
+	// same new (non-baselined) violations counted in DriftDetectedError.Count.
+	CollectedViolations []Violation
+	// SuggestFixes, when true, makes a second LLM call (llm.SuggestRemediation)
+	// for each newly-reported violation to produce a short, unverified
+	// remediation pointer. Off by default: it doubles LLM calls per violation.
+	SuggestFixes bool
+}
+
+// Violation is the structured, machine-readable form of a single reported
+// violation, used for --format json.
+type Violation struct {
+	File       string `json:"file"`
+	ADRID      string `json:"adr_id"`
+	ADRTitle   string `json:"adr_title"`
+	Line       int    `json:"line"`
+	Reasoning  string `json:"reasoning"`
+	QuotedCode string `json:"quoted_code"`
+	Suggestion string `json:"suggestion,omitempty"`
 }
 
 // ErrDriftDetected identifies analysis results that contain architectural violations.
@@ -88,13 +120,21 @@ func (e *Engine) embedProvider() llm.Provider {
 // Log prints debug information if the engine is in debug mode.
 func (e *Engine) Log(format string, args ...interface{}) {
 	if e.Debug {
-		fmt.Printf("[DEBUG] "+format+"\n", args...)
+		_, _ = fmt.Fprintf(e.writer(), "[DEBUG] "+format+"\n", args...)
 	}
 }
 
 // Info prints standard informational messages.
 func (e *Engine) Info(format string, args ...interface{}) {
-	fmt.Printf(format+"\n", args...)
+	_, _ = fmt.Fprintf(e.writer(), format+"\n", args...)
+}
+
+// writer returns Writer, defaulting to os.Stdout.
+func (e *Engine) writer() io.Writer {
+	if e.Writer != nil {
+		return e.Writer
+	}
+	return os.Stdout
 }
 
 // Run executes the analysis pipeline across all files provided by the ContentProvider.
@@ -105,12 +145,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	var (
-		violations       int
-		baselinedCount   int
-		skippedFiles     int
-		skippedADRChecks int
-		collectedEntries []baseline.Entry
-		mu               sync.Mutex
+		violations          int
+		baselinedCount      int
+		skippedFiles        int
+		skippedADRChecks    int
+		collectedEntries    []baseline.Entry
+		collectedViolations []Violation
+		mu                  sync.Mutex
 	)
 
 	concurrency := e.Config.Analysis.MaxConcurrency
@@ -118,11 +159,21 @@ func (e *Engine) Run(ctx context.Context) error {
 		concurrency = 5
 	}
 
+	topKADRs := e.Config.Analysis.MaxRelevantADRs
+	if topKADRs <= 0 {
+		topKADRs = 3
+	}
+
 	var g errgroup.Group
 	g.SetLimit(concurrency)
 
+	_, explicitFiles := e.Content.(*MultiFileProvider)
+
 	for _, file := range files {
 		if e.shouldExclude(file) {
+			if explicitFiles && file != baseline.Path {
+				e.Log("Skipping %s: explicitly requested but matches exclude_patterns", file)
+			}
 			continue
 		}
 
@@ -139,7 +190,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			if err != nil {
 				fmt.Fprintf(&sb, "Error reading file %s: %v\n", file, err)
 				mu.Lock()
-				fmt.Print(sb.String())
+				_, _ = fmt.Fprint(e.writer(), sb.String())
 				skippedFiles++
 				mu.Unlock()
 				return nil
@@ -152,7 +203,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			if diffMode == "truncated" && e.CI && !e.UpdateBaseline {
 				fmt.Fprintf(&sb, "  [WARN-OPEN] File %s was truncated for analysis. In CI mode this is treated as a warning (no failure).\n", file)
 				mu.Lock()
-				fmt.Print(sb.String())
+				_, _ = fmt.Fprint(e.writer(), sb.String())
 				mu.Unlock()
 				return nil
 			}
@@ -178,19 +229,37 @@ func (e *Engine) Run(ctx context.Context) error {
 			if err != nil {
 				fmt.Fprintf(&sb, "Error generating embedding for %s: %v\n", file, err)
 				mu.Lock()
-				fmt.Print(sb.String())
+				_, _ = fmt.Fprint(e.writer(), sb.String())
 				skippedFiles++
 				mu.Unlock()
 				return nil
 			}
 
-			hits := e.Store.Search(embedding, e.Config.VectorStore.SimilarityThreshold, 3)
+			threshold := e.Config.VectorStore.SimilarityThreshold
+
+			var hits []index.SearchResult
+			if e.Debug {
+				var rejected, truncated []index.SearchResult
+				hits, rejected, truncated = e.Store.SearchWithDebugInfo(embedding, threshold, topKADRs, file)
+
+				for _, r := range rejected {
+					effective := index.EffectiveThreshold(r.ADR, threshold)
+					fmt.Fprintf(&sb, "  Below threshold: %s (score %.2f < threshold %.2f)\n", r.ADR.Title, r.Score, effective)
+				}
+				totalQualifying := len(hits) + len(truncated)
+				for i, r := range truncated {
+					fmt.Fprintf(&sb, "  Cut by top-K limit: %s (score %.2f, rank %d of %d qualifying ADRs)\n", r.ADR.Title, r.Score, len(hits)+i+1, totalQualifying)
+				}
+			} else {
+				hits = e.Store.Search(embedding, threshold, topKADRs, file)
+			}
+
 			if len(hits) == 0 {
 				if e.Debug {
 					fmt.Fprintf(&sb, "  No relevant ADRs found.\n")
 				}
 				mu.Lock()
-				fmt.Print(sb.String())
+				_, _ = fmt.Fprint(e.writer(), sb.String())
 				mu.Unlock()
 				return nil
 			}
@@ -203,11 +272,8 @@ func (e *Engine) Run(ctx context.Context) error {
 			localBaselined := 0
 			localSkippedADRChecks := 0
 			var localBaselineEntries []baseline.Entry
+			var localViolationRecords []Violation
 			for _, hit := range hits {
-				if hit.ADR.Scope != "" && !matchGlob(hit.ADR.Scope, file) {
-					continue
-				}
-
 				// Check for ignore directive (optimization: only check header)
 				header := content
 				if len(header) > 2000 {
@@ -229,7 +295,13 @@ func (e *Engine) Run(ctx context.Context) error {
 					systemPrompt = llm.DefaultSystemPrompt
 				}
 
-				cacheKey := cache.ComputeAnalysisKey(e.Config.LLM.Model, hit.ADR.Content, content, systemPrompt, llm.ChatPrompt)
+				cacheKey := cache.ComputeAnalysisKey(cache.AnalysisKeyInput{
+					ModelName:          e.Config.LLM.Model,
+					ADRContent:         hit.ADR.Content,
+					FileContent:        content,
+					SystemPrompt:       systemPrompt,
+					UserPromptTemplate: llm.ChatPrompt,
+				})
 
 				var res *llm.AnalysisResult
 				if e.Cache != nil {
@@ -262,10 +334,25 @@ func (e *Engine) Run(ctx context.Context) error {
 				}
 
 				if res.Violation {
-					lineNum := e.findLineNumber(content, res.QuotedCode)
+					// Verified against the escaped form of content -- what the LLM
+					// actually saw (llm.EscapePromptDelimiter), not the raw file.
+					escapedContent := llm.EscapePromptDelimiter(content)
+					lineNum := e.findLineNumber(escapedContent, res.QuotedCode)
+					verified := res.QuotedCode == "" || strings.Contains(escapedContent, res.QuotedCode)
 					switch {
 					case e.UpdateBaseline:
-						writeViolationOutput(&sb, "VIOLATION", hit.ADR.Title, lineNum, res.Reasoning, res.QuotedCode)
+						reason := e.BaselineReason
+						if reason == "" {
+							reason = e.Baseline.ReasonFor(hit.ADR.ID, file)
+						}
+						writeViolationOutput(&sb, violationOutput{
+							Label:          "VIOLATION",
+							Title:          hit.ADR.Title,
+							LineNum:        lineNum,
+							Reasoning:      res.Reasoning,
+							QuotedCode:     res.QuotedCode,
+							BaselineReason: reason,
+						}, verified)
 						// A QuotedCode that won't match the file verbatim would
 						// suppress nothing -- skip rather than write a dead entry.
 						if res.QuotedCode == "" || strings.Contains(baselineContent, res.QuotedCode) {
@@ -273,28 +360,89 @@ func (e *Engine) Run(ctx context.Context) error {
 								ADRID:      hit.ADR.ID,
 								File:       file,
 								QuotedCode: res.QuotedCode,
+								Reason:     reason,
 							})
 						} else {
 							fmt.Fprintf(&sb, "    Warning: quoted code not found verbatim in file; skipping baseline entry\n")
 						}
 					case e.Baseline.IsSuppressed(hit.ADR.ID, file, baselineContent):
-						writeViolationOutput(&sb, "BASELINED", hit.ADR.Title, lineNum, res.Reasoning, res.QuotedCode)
+						writeViolationOutput(&sb, violationOutput{
+							Label:          "BASELINED",
+							Title:          hit.ADR.Title,
+							LineNum:        lineNum,
+							Reasoning:      res.Reasoning,
+							QuotedCode:     res.QuotedCode,
+							BaselineReason: e.Baseline.ReasonFor(hit.ADR.ID, file),
+						}, verified)
 						localBaselined++
 					default:
-						writeViolationOutput(&sb, "VIOLATION", hit.ADR.Title, lineNum, res.Reasoning, res.QuotedCode)
+						var suggestion string
+						if e.SuggestFixes && verified {
+							suggestionKey := cache.ComputeSuggestionKey(cache.SuggestionKeyInput{
+								ModelName:                e.Config.LLM.Model,
+								ADRContent:               hit.ADR.Content,
+								FileContent:              content,
+								Filename:                 file,
+								Reasoning:                res.Reasoning,
+								QuotedCode:               res.QuotedCode,
+								SuggestionSystemPrompt:   llm.SuggestionSystemPrompt,
+								SuggestionPromptTemplate: llm.SuggestionPrompt,
+							})
+							if e.Cache != nil {
+								if cached, found, err := e.Cache.GetSuggestion(suggestionKey); err == nil && found {
+									suggestion = cached
+								}
+							}
+							if suggestion == "" {
+								s, sErr := llm.SuggestRemediation(ctx, e.Provider, hit.ADR.Content, content, file, res.Reasoning, res.QuotedCode)
+								switch {
+								case sErr != nil:
+									fmt.Fprintf(&sb, "    Warning: suggestion generation failed: %v\n", sErr)
+								case s == "":
+									fmt.Fprintf(&sb, "    Warning: suggestion generation returned an empty suggestion\n")
+								default:
+									suggestion = s
+									if e.Cache != nil {
+										if err := e.Cache.PutSuggestion(suggestionKey, s); err != nil {
+											e.Log("Failed to cache suggestion: %v", err)
+										}
+									}
+								}
+							}
+						}
+						writeViolationOutput(&sb, violationOutput{
+							Label:      "VIOLATION",
+							Title:      hit.ADR.Title,
+							LineNum:    lineNum,
+							Reasoning:  res.Reasoning,
+							QuotedCode: res.QuotedCode,
+							Suggestion: suggestion,
+						}, verified)
 						localViolations++
+						if e.JSONOutput {
+							localViolationRecords = append(localViolationRecords, Violation{
+								File:       file,
+								ADRID:      hit.ADR.ID,
+								ADRTitle:   hit.ADR.Title,
+								Line:       lineNum,
+								Reasoning:  res.Reasoning,
+								QuotedCode: res.QuotedCode,
+								Suggestion: suggestion,
+							})
+						}
 					}
 				}
 			}
 
 			mu.Lock()
-			fmt.Print(sb.String())
+			_, _ = fmt.Fprint(e.writer(), sb.String())
 			violations += localViolations
 			baselinedCount += localBaselined
 			skippedADRChecks += localSkippedADRChecks
 			if e.UpdateBaseline {
 				collectedEntries = append(collectedEntries, localBaselineEntries...)
 			}
+			collectedViolations = append(collectedViolations, localViolationRecords...)
 			mu.Unlock()
 			return nil
 		})
@@ -302,19 +450,26 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	_ = g.Wait()
 
+	e.SkippedFiles = skippedFiles
+	e.SkippedADRChecks = skippedADRChecks
+	if e.JSONOutput {
+		if collectedViolations == nil {
+			collectedViolations = []Violation{}
+		}
+		e.CollectedViolations = collectedViolations
+	}
+
 	if e.UpdateBaseline {
 		b := baseline.New()
 		for _, entry := range collectedEntries {
-			b.Add(entry.ADRID, entry.File, entry.QuotedCode)
+			b.Add(entry)
 		}
 		e.CollectedBaseline = b
-		e.SkippedFiles = skippedFiles
-		e.SkippedADRChecks = skippedADRChecks
 		return nil
 	}
 
-	if (e.Baseline != nil && (violations > 0 || baselinedCount > 0)) || skippedFiles > 0 {
-		e.Info("%d new violation(s), %d baselined, %d file(s) skipped due to errors.", violations, baselinedCount, skippedFiles)
+	if (e.Baseline != nil && (violations > 0 || baselinedCount > 0)) || skippedFiles > 0 || skippedADRChecks > 0 {
+		e.Info("%d new violation(s), %d baselined, %d file(s) skipped due to errors, %d ADR check(s) skipped due to LLM errors.", violations, baselinedCount, skippedFiles, skippedADRChecks)
 	}
 
 	if violations > 0 {
@@ -331,7 +486,7 @@ func (e *Engine) shouldExclude(path string) bool {
 		return true
 	}
 	for _, pattern := range e.Config.Analysis.ExcludePatterns {
-		if matchGlob(pattern, path) {
+		if index.MatchGlob(pattern, path) {
 			return true
 		}
 	}
@@ -505,10 +660,30 @@ func (e *Engine) findLineNumber(content, quote string) int {
 	return len(lines)
 }
 
-func writeViolationOutput(sb *strings.Builder, label, title string, lineNum int, reasoning, quotedCode string) {
-	fmt.Fprintf(sb, "    [%s] %s [Line %d]\n", label, title, lineNum)
-	fmt.Fprintf(sb, "    Reasoning: %s\n", reasoning)
-	if quotedCode != "" {
-		fmt.Fprintf(sb, "    Code: %s\n", quotedCode)
+type violationOutput struct {
+	Label          string
+	Title          string
+	LineNum        int
+	Reasoning      string
+	QuotedCode     string
+	Suggestion     string
+	BaselineReason string
+}
+
+func writeViolationOutput(sb *strings.Builder, v violationOutput, verified bool) {
+	if verified {
+		fmt.Fprintf(sb, "    [%s] %s [Line %d]\n", v.Label, v.Title, v.LineNum)
+	} else {
+		fmt.Fprintf(sb, "    [%s] %s [UNVERIFIED: quoted code not found in analyzed content]\n", v.Label, v.Title)
+	}
+	fmt.Fprintf(sb, "    Reasoning: %s\n", v.Reasoning)
+	if v.QuotedCode != "" {
+		fmt.Fprintf(sb, "    Code: %s\n", v.QuotedCode)
+	}
+	if v.Suggestion != "" {
+		fmt.Fprintf(sb, "    Suggestion (unverified): %s\n", v.Suggestion)
+	}
+	if v.BaselineReason != "" {
+		fmt.Fprintf(sb, "    Baseline Reason: %s\n", v.BaselineReason)
 	}
 }

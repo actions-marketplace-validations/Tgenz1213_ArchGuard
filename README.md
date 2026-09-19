@@ -99,17 +99,23 @@ llm:
   base_url: "http://localhost:11434"
   max_tokens: 8000
   temperature: 0.0
+  # system_prompt: "..." # optional; fully replaces ArchGuard's default judgment
+  #   instructions (literal-contradiction, no-inference rules). When set, it is
+  #   the only source of judgment behavior sent to the LLM.
 
 vector_store:
   provider: "ollama"
   model: "nomic-embed-text"
   embedding_dim: 768
-  similarity_threshold: 0.75
+  similarity_threshold: 0.75 # Global default; an ADR's own frontmatter similarity_threshold overrides this per-ADR
   connection_string: "" # e.g. postgres://user:pass@localhost:5432/archguard
   embedding_concurrency: 5
 
 analysis:
   adr_path: "./docs/arch"
+  # adr_id_pattern: '^adr-(\d+)-' # Optional: overrides default first-hyphen-split ADR ID extraction
+  # frontmatter_mappings: # Optional: remap canonical frontmatter keys to your corpus's own field names
+  #   scope: "applies_to"
   accepted_statuses: ["Accepted", "Active"] # Use ["*"] to include all statuses
   exclude_patterns:
     - "**/*_test.go"
@@ -142,11 +148,24 @@ ArchGuard parses ADRs from Markdown files. Strict **YAML frontmatter** is requir
 
 **Location:** Store your ADRs in the folder specified by `analysis.adr_path` (default `./docs/arch`).
 
+**ADR IDs:** By default, an ADR's ID is derived from its filename by splitting on the first hyphen (`0001-use-postgres.md` → `0001`). If your naming convention doesn't fit that pattern (e.g. `adr-1-use-postgres.md` and `adr-2-use-kafka.md`, which would otherwise both collapse to `adr`), set `analysis.adr_id_pattern` to a regex: capture group 1 is used if the pattern defines one, otherwise the whole match is used. A file whose name doesn't match the pattern falls back to the default first-hyphen split, so mixed-convention corpora are handled gracefully. Leave it unset for the default behavior.
+
+**Frontmatter Field Mappings:** If your existing ADR corpus uses different frontmatter key names (e.g. MADR-style or your own house convention), set `analysis.frontmatter_mappings` to remap any of the four canonical fields (`title`, `status`, `scope`, `similarity_threshold`) to the YAML key your files actually use:
+
+```yaml
+analysis:
+  frontmatter_mappings:
+    scope: "applies_to"
+```
+
+With this configured, an ADR's `applies_to: "**/*.go"` frontmatter key is read as `scope`. Any field left out of the mapping keeps reading its canonical key unchanged — this is a per-field override, not an all-or-nothing schema replacement. A mapping naming an unknown canonical field, or one that would make two fields read the same YAML key, is rejected at startup.
+
 ```markdown
 ---
 title: "No Secrets in Logs"
 status: "Accepted"
 scope: "**/*.go" # Glob pattern matching file paths to apply this ADR to
+similarity_threshold: 0.65 # Optional: overrides vector_store.similarity_threshold for this ADR only
 ---
 
 ## Context
@@ -158,11 +177,20 @@ Logging sensitive data is a security risk.
 Do not print passwords or secrets to console logs.
 ```
 
+`scope` can also be a YAML list of globs, matched with OR semantics (the ADR applies if *any* pattern matches):
+
+```yaml
+scope:
+  - "internal/api/**"
+  - "internal/handlers/**"
+```
+
 **Frontmatter Fields:**
 
 - `title` (Required): Human friendly title.
 - `status` (Required): Must match a value in `analysis.accepted_statuses`.
-- `scope` (Optional): Glob pattern (e.g., `src/**/*.ts`). Supports standard Go globbing and recursive `**` patterns.
+- `scope` (Optional): A glob pattern (e.g., `src/**/*.ts`) or a YAML list of glob patterns matched with OR semantics. Supports standard Go globbing and recursive `**` patterns.
+- `similarity_threshold` (Optional): Float overriding the global `vector_store.similarity_threshold` for matching against this ADR only. Falls back to the global value when unset.
 
 ### Remote Vector Databases (pgvector)
 By default, ArchGuard stores your ADR embeddings in a local `.archguard/index.json` file. For large teams or CI environments, you can centralize this index using PostgreSQL and the `pgvector` extension.
@@ -195,6 +223,9 @@ This will automatically create the `archguard_adrs` table and safely scope all A
   - `--debug`: Enable verbose logging.
   - `--ci`: Enable CI-safe mode.
   - `--update-baseline`: Scan the full repository (regardless of other flags/args) and overwrite `archguard-baseline.json` with every currently-detected violation.
+  - `--baseline-reason <text>`: With `--update-baseline`, records `<text>` (e.g. `"accepted-debt"` or `"false-positive"`) as the reason on every entry collected this run, applying to all entries rather than just newly baselined ones. Has no effect without `--update-baseline`.
+  - `--format <text|json>`: Output format, default `text`. With `--format json`, stdout carries a single JSON document and nothing else (no banner, no progress/debug text — that goes to stderr instead), so it's safe to pipe into another tool. Exit codes are unchanged. Has no effect with `--update-baseline`, which always prints its own text summary.
+  - `--suggest-fixes`: For each newly-reported violation, make a second LLM call for a short, unverified remediation pointer (never a guaranteed fix). Off by default — this roughly doubles LLM calls for files with violations.
 
 ### Automation & Exit Codes
 
@@ -205,6 +236,31 @@ This will automatically create the `archguard_adrs` table and safely scope all A
 - **4**: Architectural drift detected.
 - **5**: Index error (failed to build, load, or fetch ADRs for the vector store).
 
+### Machine-Readable Output
+
+`archguard check --format json` prints a single JSON document to stdout (all progress/debug/error text moves to stderr) so it can be piped into another tool:
+
+```json
+{
+  "violations": [
+    {
+      "file": "internal/api/handler.go",
+      "adr_id": "0003",
+      "adr_title": "Repository Pattern for Data Access",
+      "line": 42,
+      "reasoning": "Handler queries the database directly instead of going through a repository.",
+      "quoted_code": "db.Query(\"SELECT * FROM users WHERE id = ?\", id)",
+      "suggestion": "Move the query into a repository method and call that from the handler instead."
+    }
+  ],
+  "count": 1
+}
+```
+
+`count` matches the number of new (non-baselined) violations that drives the `4` (drift detected) exit code above. `suggestion` is present only when `--suggest-fixes` was passed; it's an LLM-generated pointer, not a verified or guaranteed fix, and it is omitted from the JSON entirely (not an empty string) when `--suggest-fixes` is off or the LLM produced nothing.
+
+> **Note:** run `archguard index` before a `--format json` check. If the index needs an automatic rebuild during `check` (e.g. a stale/missing index, or an ADR provider warning), that rebuild's own progress text currently still prints to stdout ahead of the JSON document (tracked in [#163](https://github.com/Tgenz1213/ArchGuard/issues/163)). With an up-to-date index this doesn't happen.
+
 ### Suppression
 
 Intentionally ignore a violation for a specific file using a comment:
@@ -213,7 +269,7 @@ Intentionally ignore a violation for a specific file using a comment:
 // archguard-ignore: 0001
 ```
 
-- The ignore token must match the **ADR ID** (the numeric prefix of the filename).
+- The ignore token must match the **ADR ID** — by default the numeric prefix of the filename, or whatever `analysis.adr_id_pattern` extracts if configured.
 
 ### Continuous Integration (CI)
 

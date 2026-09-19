@@ -76,7 +76,7 @@ func TestGroundTruthSearch_ForcesSeqScanAndMatchesExactOrder(t *testing.T) {
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "gt_test_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "gt_test_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	require.NoError(t, store.Load("", "test-model", 2, ""))
 
@@ -251,7 +251,7 @@ func TestSeedProjectADRs_InsertsExpectedRowCount(t *testing.T) {
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "seed_test_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "seed_test_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	require.NoError(t, store.Load("", "test-model", 8, ""))
 
@@ -273,7 +273,7 @@ func TestProbeIterativeScanSupport_ReturnsVersionWithoutError(t *testing.T) {
 	ctx := context.Background()
 	connStr := setupPgContainer(t, ctx)
 
-	store, err := index.NewPgStore(connStr, "probe_test_project", 5, index.HNSWOptions{})
+	store, err := index.NewPgStore(connStr, "probe_test_project", 5, index.HNSWOptions{}, nil)
 	require.NoError(t, err)
 	require.NoError(t, store.Load("", "test-model", 2, ""))
 
@@ -337,7 +337,7 @@ func BenchmarkPgStoreSearch_ProjectFiltering(b *testing.B) {
 	ctx := context.Background()
 	connStr := setupPgContainer(b, ctx)
 
-	initStore, err := index.NewPgStore(connStr, "bench_init", 5, index.HNSWOptions{})
+	initStore, err := index.NewPgStore(connStr, "bench_init", 5, index.HNSWOptions{}, nil)
 	require.NoError(b, err)
 	require.NoError(b, initStore.Load("", "bench-model", benchEmbeddingDim, ""))
 	initStore.Close()
@@ -403,11 +403,11 @@ func measureScalePoint(ctx context.Context, b *testing.B, pool *pgxpool.Pool, co
 	}
 
 	require.NoError(b, assertGroundTruthAvoidsIndexScan(ctx, pool, queries[0], benchTargetProject, benchThreshold, benchTopK))
-	require.NoError(b, assertUsesHNSWIndex(ctx, connStr, queries[0], benchTargetProject, benchThreshold, benchTopK))
+	require.NoError(b, assertUsesHNSWIndex(ctx, connStr, queries[0], benchTargetProject, index.MaxSearchCandidates))
 
 	b.Run("baseline", func(b *testing.B) {
 		disabled := false
-		store, err := index.NewPgStore(connStr, benchTargetProject, 5, index.HNSWOptions{IterativeScan: &disabled})
+		store, err := index.NewPgStore(connStr, benchTargetProject, 5, index.HNSWOptions{IterativeScan: &disabled}, nil)
 		require.NoError(b, err)
 		defer store.Close()
 		reportRecallAndLatency(b, store, queries, groundTruth)
@@ -425,10 +425,10 @@ func measureScalePoint(ctx context.Context, b *testing.B, pool *pgxpool.Pool, co
 		_, _ = pool.Exec(ctx, "ALTER ROLE postgres RESET hnsw.iterative_scan")
 	}()
 
-	require.NoError(b, assertUsesHNSWIndex(ctx, connStr, queries[0], benchTargetProject, benchThreshold, benchTopK))
+	require.NoError(b, assertUsesHNSWIndex(ctx, connStr, queries[0], benchTargetProject, index.MaxSearchCandidates))
 
 	b.Run("iterative_scan", func(b *testing.B) {
-		store, err := index.NewPgStore(connStr, benchTargetProject, 5, index.HNSWOptions{})
+		store, err := index.NewPgStore(connStr, benchTargetProject, 5, index.HNSWOptions{}, nil)
 		require.NoError(b, err)
 		defer store.Close()
 		reportRecallAndLatency(b, store, queries, groundTruth)
@@ -437,7 +437,7 @@ func measureScalePoint(ctx context.Context, b *testing.B, pool *pgxpool.Pool, co
 
 // assertUsesHNSWIndex fails if the query plan doesn't use the HNSW index.
 // Opens a fresh connection with no GUC overrides, matching what Search sees.
-func assertUsesHNSWIndex(ctx context.Context, connStr string, queryEmbedding []float32, projectName string, threshold float64, topK int) error {
+func assertUsesHNSWIndex(ctx context.Context, connStr string, queryEmbedding []float32, projectName string, topK int) error {
 	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
 		return err
@@ -448,9 +448,8 @@ func assertUsesHNSWIndex(ctx context.Context, connStr string, queryEmbedding []f
 	}
 
 	vec := pgvector.NewVector(queryEmbedding)
-	distanceThreshold := 1.0 - threshold
 
-	rows, err := conn.Query(ctx, "EXPLAIN "+index.SearchQuery, vec, projectName, distanceThreshold, topK)
+	rows, err := conn.Query(ctx, "EXPLAIN "+index.SearchQuery, vec, projectName, topK)
 	if err != nil {
 		return err
 	}
@@ -534,7 +533,7 @@ func reportRecallAndLatency(b *testing.B, store *index.PgStore, queries [][]floa
 
 	for i, q := range queries {
 		start := time.Now()
-		results := store.Search(q, benchThreshold, benchTopK)
+		results := store.Search(q, benchThreshold, benchTopK, "")
 		latencies[i] = time.Since(start)
 		resultCountSum += len(results)
 

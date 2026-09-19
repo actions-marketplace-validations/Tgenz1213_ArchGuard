@@ -1,0 +1,80 @@
+package index
+
+import "sort"
+
+// filterByScope keeps ADRs with no scope restriction or a scope glob matching
+// filePath, overwriting candidates in place (call before rankAndLimit, not after).
+func filterByScope(candidates []SearchResult, filePath string) []SearchResult {
+	filtered := candidates[:0]
+	for _, c := range candidates {
+		if c.ADR.Scope.Matches(filePath) {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// EffectiveThreshold returns an ADR's own similarity_threshold override
+// when set, otherwise the global vector_store.similarity_threshold value.
+func EffectiveThreshold(adr *ADR, global float64) float64 {
+	if adr.SimilarityThreshold != nil {
+		return *adr.SimilarityThreshold
+	}
+	return global
+}
+
+// meetsThreshold is the single predicate filterByThreshold and
+// filterBelowThreshold both key off, so the two can never drift apart.
+func meetsThreshold(c SearchResult, global float64) bool {
+	return c.Score >= EffectiveThreshold(c.ADR, global)
+}
+
+// filterByThreshold keeps candidates whose Score is at least threshold,
+// mirroring filterByScope's placement ahead of rankAndLimit.
+func filterByThreshold(candidates []SearchResult, threshold float64) []SearchResult {
+	filtered := candidates[:0]
+	for _, c := range candidates {
+		if meetsThreshold(c, threshold) {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// filterBelowThreshold keeps candidates whose Score is below threshold --
+// filterByThreshold's complement, for --debug diagnostics only.
+func filterBelowThreshold(candidates []SearchResult, threshold float64) []SearchResult {
+	filtered := candidates[:0]
+	for _, c := range candidates {
+		if !meetsThreshold(c, threshold) {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// rankAndLimit sorts candidates by descending similarity score and
+// truncates to at most topK.
+func rankAndLimit(candidates []SearchResult, topK int) []SearchResult {
+	if topK < 0 {
+		topK = 0
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Score > candidates[j].Score })
+	if len(candidates) > topK {
+		return candidates[:topK]
+	}
+	return candidates
+}
+
+// truncatedByTopK returns the candidates ranked after topK -- rankAndLimit's
+// complement, ranked descending by score -- for --debug diagnostics only.
+func truncatedByTopK(candidates []SearchResult, topK int) []SearchResult {
+	if topK < 0 {
+		topK = 0
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Score > candidates[j].Score })
+	if len(candidates) > topK {
+		return candidates[topK:]
+	}
+	return nil
+}

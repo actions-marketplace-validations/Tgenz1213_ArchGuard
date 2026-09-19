@@ -66,14 +66,23 @@ func (p *AllProvider) GetDiff(path string) (string, error) {
 	return git.GetWorktreeDiff(path)
 }
 
-// SingleFileProvider scans a specific file path from the worktree.
-type SingleFileProvider struct{ Path string }
+// MultiFileProvider scans a specific set of file paths from the worktree.
+type MultiFileProvider struct{ Paths []string }
 
-func (p *SingleFileProvider) GetFiles() ([]string, error) {
-	return []string{p.Path}, nil
+func (p *MultiFileProvider) GetFiles() ([]string, error) {
+	seen := make(map[string]struct{}, len(p.Paths))
+	files := make([]string, 0, len(p.Paths))
+	for _, path := range p.Paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		files = append(files, path)
+	}
+	return files, nil
 }
 
-func (p *SingleFileProvider) GetContent(path string) (string, error) {
+func (p *MultiFileProvider) GetContent(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -81,6 +90,6 @@ func (p *SingleFileProvider) GetContent(path string) (string, error) {
 	return string(b), nil
 }
 
-func (p *SingleFileProvider) GetDiff(path string) (string, error) {
+func (p *MultiFileProvider) GetDiff(path string) (string, error) {
 	return git.GetWorktreeDiff(path)
 }

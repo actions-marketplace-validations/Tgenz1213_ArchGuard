@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/tgenz1213/archguard/internal/atomicfile"
 	"github.com/tgenz1213/archguard/internal/config"
@@ -15,22 +17,84 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// diagWriter resolves w to os.Stdout when nil, evaluated at each call rather
+// than cached, so tests that redirect os.Stdout after construction still work.
+func diagWriter(w io.Writer) io.Writer {
+	if w == nil {
+		return os.Stdout
+	}
+	return w
+}
+
+var diagMu sync.Mutex
+
+// diagPrintf and diagPrintln serialize diagnostic writes -- a caller-supplied
+// writer (unlike os.Stdout) isn't guaranteed safe for the concurrent writers
+// this package has (CompositeProvider's providers, PgStore's pooled AfterConnect).
+func diagPrintf(w io.Writer, format string, args ...any) {
+	diagMu.Lock()
+	defer diagMu.Unlock()
+	_, _ = fmt.Fprintf(diagWriter(w), format, args...)
+}
+
+func diagPrintln(w io.Writer) {
+	diagMu.Lock()
+	defer diagMu.Unlock()
+	_, _ = fmt.Fprintln(diagWriter(w))
+}
+
+// SkippedADR records one ADR that BuildIndex could not embed or persist.
+type SkippedADR struct {
+	RelPath string
+	Err     error
+}
+
+// BuildIndexResult reports the outcome of a BuildIndex run. Skipped can be
+// non-empty whether or not BuildIndex also returns an error.
+type BuildIndexResult struct {
+	IndexSummary
+	Skipped []SkippedADR
+	// Attempted is false only when BuildIndex failed before fetching ADRs,
+	// distinguishing that from a fetch that genuinely found nothing.
+	Attempted bool
+}
+
 // VectorStore defines the interface for interacting with the index storage.
 type VectorStore interface {
 	CalculateHash(adrs []ADR, modelName string) (string, error)
 	Load(path, modelName string, dim int, currentHash string) error
 	Save(path string) error
-	BuildIndex(ctx context.Context, modelName string, dim int, provider llm.Provider, adrProvider Provider) error
-	Search(queryEmbedding []float32, threshold float64, topK int) []SearchResult
+	BuildIndex(ctx context.Context, modelName string, dim int, provider llm.Provider, adrProvider Provider) (BuildIndexResult, error)
+	// Search filters candidates by scope, then by threshold, before
+	// ranking and cutting to topK -- see filterByScope, filterByThreshold, and rankAndLimit.
+	Search(queryEmbedding []float32, threshold float64, topK int, filePath string) []SearchResult
+	// SearchRejected returns scope-matched candidates scoring below threshold.
+	// Debug diagnostics only -- call it only inside an `if debug` branch.
+	SearchRejected(queryEmbedding []float32, threshold float64, topK int, filePath string) []SearchResult
+	// SearchTruncated returns scope-matched, threshold-passing candidates cut
+	// by the topK limit. Debug diagnostics only -- call it only inside an
+	// `if debug` branch.
+	SearchTruncated(queryEmbedding []float32, threshold float64, topK int, filePath string) []SearchResult
+	// SearchWithDebugInfo derives hits, rejected, and truncated from a single
+	// scope-filtered candidate set, guaranteeing they agree with each other --
+	// unlike calling Search/SearchRejected/SearchTruncated independently,
+	// which for PgStore under hnsw.iterative_scan=relaxed_order could each
+	// see a different approximate candidate set (see
+	// docs/arch/0005-hnsw-iterative-scan-for-project-filtered-search.md) and
+	// disagree on whether an ADR is a hit, rejected, or truncated. Debug
+	// diagnostics only -- call it only inside an `if debug` branch; use
+	// Search alone otherwise.
+	SearchWithDebugInfo(queryEmbedding []float32, threshold float64, topK int, filePath string) (hits, rejected, truncated []SearchResult)
 }
 
 // LocalStore manages the persistence and retrieval of ADR embeddings and metadata.
 type LocalStore struct {
-	ADRs        []ADR  `json:"adrs"`
-	Hash        string `json:"hash"`
-	ModelName   string `json:"model_name"`
-	Dim         int    `json:"dim"`
-	concurrency int    `json:"-"`
+	ADRs        []ADR     `json:"adrs"`
+	Hash        string    `json:"hash"`
+	ModelName   string    `json:"model_name"`
+	Dim         int       `json:"dim"`
+	concurrency int       `json:"-"`
+	writer      io.Writer `json:"-"`
 }
 
 // NewLocalStore initializes a new LocalStore instance.
@@ -42,19 +106,22 @@ func NewLocalStore(concurrency int) *LocalStore {
 }
 
 // NewVectorStore creates the appropriate VectorStore based on the configuration.
-func NewVectorStore(cfg *config.Config) (VectorStore, error) {
+// A nil w defaults to os.Stdout, resolved dynamically at each write.
+func NewVectorStore(cfg *config.Config, w io.Writer) (VectorStore, error) {
 	if cfg.VectorStore.ConnectionString != "" {
 		return NewPgStore(cfg.VectorStore.ConnectionString, cfg.ProjectName, cfg.VectorStore.EmbeddingConcurrency, HNSWOptions{
 			Enabled:       cfg.VectorStore.ReindexEnabled,
 			Threshold:     cfg.VectorStore.ReindexThreshold,
 			Concurrently:  cfg.VectorStore.ReindexConcurrently,
 			IterativeScan: cfg.VectorStore.IterativeScan,
-		})
+		}, w)
 	}
-	return NewLocalStore(cfg.VectorStore.EmbeddingConcurrency), nil
+	store := NewLocalStore(cfg.VectorStore.EmbeddingConcurrency)
+	store.writer = w
+	return store, nil
 }
 
-// CalculateHash generates a hash of all ADR file contents and the model name
+// CalculateHash hashes the model name plus each ADR's RelPath, Content, and ID
 // to detect if the index needs a rebuild.
 func (s *LocalStore) CalculateHash(adrs []ADR, modelName string) (string, error) {
 	hasher := sha256.New()
@@ -63,6 +130,7 @@ func (s *LocalStore) CalculateHash(adrs []ADR, modelName string) (string, error)
 	for _, adr := range adrs {
 		hasher.Write([]byte(adr.RelPath))
 		hasher.Write([]byte(adr.Content))
+		hasher.Write([]byte(adr.ID))
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
@@ -72,7 +140,7 @@ func (s *LocalStore) Load(path, modelName string, dim int, currentHash string) e
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return fmt.Errorf("index file not found: %s", path)
 		}
 		return err
 	}
@@ -108,12 +176,10 @@ func (s *LocalStore) Save(path string) error {
 	return atomicfile.Write(path, data)
 }
 
-// BuildIndex crawls the specified directory, parses ADRs, and generates embeddings in parallel.
-// Uses Delta Indexing to skip re-computing embeddings for unchanged ADRs.
-func (s *LocalStore) BuildIndex(ctx context.Context, modelName string, dim int, provider llm.Provider, adrProvider Provider) error {
-	validADRs, err := adrProvider.GetADRs(ctx)
+func (s *LocalStore) BuildIndex(ctx context.Context, modelName string, dim int, provider llm.Provider, adrProvider Provider) (BuildIndexResult, error) {
+	validADRs, stats, err := adrProvider.GetADRs(ctx)
 	if err != nil {
-		return err
+		return BuildIndexResult{}, err
 	}
 
 	existingMap := make(map[string]ADR)
@@ -131,7 +197,10 @@ func (s *LocalStore) BuildIndex(ctx context.Context, modelName string, dim int, 
 		}
 	}
 
-	fmt.Printf("Found %d valid ADRs. Generating embeddings for %d new/modified ADRs...\n", len(validADRs), len(adrsToEmbed))
+	diagPrintf(s.writer, "Found %d valid ADRs. Generating embeddings for %d new/modified ADRs...\n", len(validADRs), len(adrsToEmbed))
+
+	result := BuildIndexResult{IndexSummary: summarizeCorpus(validADRs, stats), Attempted: true}
+	failed := make(map[int]bool)
 
 	if len(adrsToEmbed) > 0 {
 		concurrency := s.concurrency
@@ -139,42 +208,75 @@ func (s *LocalStore) BuildIndex(ctx context.Context, modelName string, dim int, 
 			concurrency = 5
 		}
 
-		g, gCtx := errgroup.WithContext(ctx)
+		var mu sync.Mutex
+		g := new(errgroup.Group)
 		g.SetLimit(concurrency)
+
+		markFailed := func(idx int, err error) {
+			mu.Lock()
+			failed[idx] = true
+			result.Skipped = append(result.Skipped, SkippedADR{RelPath: validADRs[idx].RelPath, Err: err})
+			diagPrintf(s.writer, "\nWarning: skipping ADR %s: %v\n", validADRs[idx].RelPath, err)
+			mu.Unlock()
+		}
 
 		for _, idx := range adrsToEmbed {
 			idx := idx
 			g.Go(func() error {
 				textToEmbed := fmt.Sprintf("Title: %s\nStatus: %s\nContent: %s", validADRs[idx].Title, validADRs[idx].Status, validADRs[idx].Content)
-				emb, err := provider.CreateEmbedding(gCtx, textToEmbed, llm.EmbeddingTaskDocument)
-				if err != nil {
-					return fmt.Errorf("failed to embed ADR %s: %w", validADRs[idx].RelPath, err)
+				emb, embErr := provider.CreateEmbedding(ctx, textToEmbed, llm.EmbeddingTaskDocument)
+				if embErr != nil {
+					markFailed(idx, embErr)
+					return nil
 				}
 				validADRs[idx].Embedding = emb
-				fmt.Printf(".")
+				mu.Lock()
+				diagPrintf(s.writer, ".")
+				mu.Unlock()
 				return nil
 			})
 		}
 
-		if err := g.Wait(); err != nil {
-			return err
-		}
-		fmt.Println()
+		_ = g.Wait()
+		diagPrintln(s.writer)
 	}
 
-	s.ADRs = validADRs
+	// Valid means successfully indexed, not merely status-accepted.
+	result.Valid = len(validADRs) - len(failed)
+
+	// Checked unconditionally: a ctx canceled before a no-embed run (every
+	// ADR unchanged) must still surface, not fall through as success.
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+
+	if len(validADRs) > 0 && len(failed) == len(validADRs) {
+		return result, fmt.Errorf("all %d ADR(s) failed to embed; index not updated", len(validADRs))
+	}
+
+	finalADRs := make([]ADR, 0, len(validADRs))
+	for i, adr := range validADRs {
+		if failed[i] {
+			continue
+		}
+		finalADRs = append(finalADRs, adr)
+	}
+
+	s.ADRs = finalADRs
 	s.ModelName = modelName
 	if dim > 0 {
 		s.Dim = dim
-	} else if len(validADRs) > 0 && len(validADRs[0].Embedding) > 0 {
-		s.Dim = len(validADRs[0].Embedding)
+	} else if len(finalADRs) > 0 && len(finalADRs[0].Embedding) > 0 {
+		s.Dim = len(finalADRs[0].Embedding)
 	}
 
+	// Hash the full fetched set, not finalADRs: the hash answers "does this
+	// index match the ADR files on disk", and a skipped ADR is still on disk.
 	hash, err := s.CalculateHash(validADRs, modelName)
 	if err != nil {
-		return fmt.Errorf("failed to calculate hash: %w", err)
+		return result, fmt.Errorf("failed to calculate hash: %w", err)
 	}
 	s.Hash = hash
 
-	return nil
+	return result, nil
 }
